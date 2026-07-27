@@ -175,9 +175,24 @@ The app should subscribe to `coop/status/#` and `coop/alert/#` for a live dashbo
 ## 9. Behavior Logic Summary
 
 1. **Day/night detection:** LDR reading below `LDR_DARK_THRESHOLD` = "dark" → system auto-arms and closes the door.
-2. **Motion while armed:** PIR trigger → deterrent fires: red LED on, buzzer tone, strobing "eyes" pattern on the matrix, for `DETERRENT_DURATION_MS` (default 5 seconds). A `coop/alert/predator` message is published once per trigger, with a cooldown (`TRIGGER_COOLDOWN_MS`, default 3s) so it doesn't spam re-triggers from the same event.
-3. **Manual button press:** always fires the deterrent regardless of armed state (useful for testing).
+2. **Motion while armed:** PIR trigger → deterrent fires: red LED on, buzzer tone, fast strobing "eyes" on the matrix, for `DETERRENT_DURATION_MS` (default 5 seconds). A `coop/alert/predator` message is published once per trigger, with a cooldown (`TRIGGER_COOLDOWN_MS`, default 3s) so it doesn't spam re-triggers from the same event.
+3. **Manual button press:** debounced and edge-triggered (won't repeat-fire if held down) — always fires the deterrent regardless of armed state (useful for testing), plus gives a brief white-flash acknowledgement on the matrix so you know the press registered.
 4. **App override:** `coop/cmd/arm` can force arming on/off regardless of light level; `coop/cmd/door` and `coop/cmd/deterrent` give direct manual control any time.
+
+## 9b. Matrix Display States (System "Face")
+
+The 8x8 matrix acts as an at-a-glance status display, so someone checking on the coop doesn't need the app open. It runs as a non-blocking state machine — animations never stall sensor reads or MQTT:
+
+| State | Visual | Meaning |
+|---|---|---|
+| Booting | Slow blue dot circling the border | WiFi/MQTT still connecting |
+| Disarmed idle | Dim static "sun" glyph | Daytime, watching but not armed |
+| Armed idle | Soft "breathing" blue moon (slow brightness pulse) | Nighttime, actively protecting, calm state |
+| Door moving | Blinking yellow arrows (~0.9s) | Servo is opening/closing the door |
+| Alert | Fast strobing red "eyes", full brightness | Predator detected — this is the actual deterrent effect |
+| (any state) | Brief full white flash overlay | Confirms a manual button press was registered |
+
+The WiFi status LED also communicates connection stages: slow blink = no WiFi, fast blink = WiFi connected but MQTT still connecting, solid = fully connected.
 
 ---
 
