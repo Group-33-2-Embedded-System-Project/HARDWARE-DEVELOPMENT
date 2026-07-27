@@ -3,16 +3,20 @@
   "author": "Smart Coop Hardware Team",
   "editor": "wokwi",
   "parts": [
-    { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 20, "left": 0, "attrs": {} },
-
+    {
+      "type": "board-esp32-devkit-c-v4",
+      "id": "esp",
+      "top": -72.1,
+      "left": 23.8,
+      "attrs": {}
+    },
     {
       "type": "wokwi-neopixel-canvas",
       "id": "matrix1",
-      "top": -260,
-      "left": -20,
+      "top": -318.4,
+      "left": 1.9,
       "attrs": { "rows": "8", "cols": "8", "pixelate": "1" }
     },
-
     {
       "type": "wokwi-pir-motion-sensor",
       "id": "pir1",
@@ -20,7 +24,6 @@
       "left": -320,
       "attrs": {}
     },
-
     {
       "type": "wokwi-photoresistor-sensor",
       "id": "ldr1",
@@ -28,7 +31,6 @@
       "left": -320,
       "attrs": {}
     },
-
     {
       "type": "wokwi-pushbutton",
       "id": "btn1",
@@ -36,7 +38,6 @@
       "left": -320,
       "attrs": { "color": "green", "xray": "1" }
     },
-
     {
       "type": "wokwi-buzzer",
       "id": "bz1",
@@ -44,13 +45,12 @@
       "left": 320,
       "attrs": { "volume": "0.1" }
     },
-
     {
       "type": "wokwi-led",
       "id": "led1",
       "top": 60,
       "left": 340,
-      "attrs": { "color": "red" }
+      "attrs": { "color": "red", "label": "ALERT" }
     },
     {
       "type": "wokwi-resistor",
@@ -59,13 +59,12 @@
       "left": 260,
       "attrs": { "value": "220" }
     },
-
     {
       "type": "wokwi-led",
       "id": "led2",
       "top": 160,
       "left": 340,
-      "attrs": { "color": "green" }
+      "attrs": { "color": "green", "label": "STATUS" }
     },
     {
       "type": "wokwi-resistor",
@@ -74,7 +73,6 @@
       "left": 260,
       "attrs": { "value": "220" }
     },
-
     {
       "type": "wokwi-servo-motor",
       "id": "servo1",
@@ -84,35 +82,35 @@
     }
   ],
   "connections": [
-    [ "pir1:VCC", "esp:5V", "red", [ "v0" ] ],
-    [ "pir1:GND", "esp:GND.1", "black", [ "v0" ] ],
-    [ "pir1:OUT", "esp:D27", "green", [ "v0" ] ],
+    [ "pir1:VCC", "esp:5V", "red", [ "h30", "v-40" ] ],
+    [ "pir1:GND", "esp:GND.1", "black", [ "h20", "v-20" ] ],
+    [ "pir1:OUT", "esp:27", "green", [ "h40", "v50" ] ],
 
-    [ "btn1:1.l", "esp:D26", "green", [ "v0" ] ],
-    [ "btn1:2.l", "esp:GND.1", "black", [ "v0" ] ],
+    [ "ldr1:VCC", "esp:3V3", "orange", [ "h50", "v-80" ] ],
+    [ "ldr1:GND", "esp:GND.1", "black", [ "h30", "v-120" ] ],
+    [ "ldr1:AO", "esp:34", "yellow", [ "h60", "v-60" ] ],
 
-    [ "ldr1:VCC", "esp:3V3", "red", [ "v0" ] ],
-    [ "ldr1:GND", "esp:GND.1", "black", [ "v0" ] ],
-    [ "ldr1:AO", "esp:D34", "yellow", [ "v0" ] ],
+    [ "btn1:1.l", "esp:26", "cyan", [ "h70", "v-220" ] ],
+    [ "btn1:2.l", "esp:GND.1", "black", [ "h40", "v-240" ] ],
 
-    [ "matrix1:VDD", "esp:5V", "red", [ "v0" ] ],
-    [ "matrix1:GND", "esp:GND.2", "black", [ "v0" ] ],
-    [ "matrix1:DIN", "esp:D5", "green", [ "v0" ] ],
+    [ "matrix1:VDD", "esp:5V", "red", [ "v20", "h60" ] ],
+    [ "matrix1:GND", "esp:GND.2", "black", [ "v30", "h-60" ] ],
+    [ "matrix1:DIN", "esp:5", "blue", [ "v40", "h-40" ] ],
 
-    [ "esp:D25", "r1:1", "green", [ "v0" ] ],
-    [ "r1:2", "led1:A", "green", [ "v0" ] ],
-    [ "led1:C", "esp:GND.2", "black", [ "v0" ] ],
+    [ "esp:25", "r1:1", "purple", [ "h0" ] ],
+    [ "r1:2", "led1:A", "purple", [ "h0" ] ],
+    [ "led1:C", "esp:GND.2", "black", [ "h20", "v-160" ] ],
 
-    [ "esp:D2", "r2:1", "green", [ "v0" ] ],
-    [ "r2:2", "led2:A", "green", [ "v0" ] ],
-    [ "led2:C", "esp:GND.2", "black", [ "v0" ] ],
+    [ "esp:2", "r2:1", "violet", [ "h0" ] ],
+    [ "r2:2", "led2:A", "violet", [ "h0" ] ],
+    [ "led2:C", "esp:GND.2", "black", [ "h30", "v-240" ] ],
 
-    [ "bz1:1", "esp:GND.2", "black", [ "v0" ] ],
-    [ "bz1:2", "esp:D33", "green", [ "v0" ] ],
+    [ "esp:33", "bz1:2", "magenta", [ "h50", "v-110" ] ],
+    [ "bz1:1", "esp:GND.2", "black", [ "h-50", "v80" ] ],
 
-    [ "servo1:GND", "esp:GND.3", "black", [ "v0" ] ],
-    [ "servo1:V+", "esp:5V", "red", [ "v0" ] ],
-    [ "servo1:PWM", "esp:D32", "orange", [ "v0" ] ]
+    [ "servo1:V+", "esp:5V", "red", [ "h-60", "v-320" ] ],
+    [ "servo1:GND", "esp:GND.2", "black", [ "h-40", "v-300" ] ],
+    [ "servo1:PWM", "esp:32", "orange", [ "h-80", "v-280" ] ]
   ],
   "dependencies": {}
 }
