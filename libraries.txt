@@ -1,0 +1,3 @@
+PubSubClient
+Adafruit NeoPixel
+ESP32Servo
