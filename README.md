@@ -2,8 +2,8 @@
 
 A WiFi-connected predator deterrent system for chicken coops. It watches for motion
 after dark, fires lights + sound + a strobing "eyes" pattern to scare off predators,
-auto-locks the coop door at night, and reports/accepts commands from a companion app
-over MQTT.
+and reports/accepts commands from a companion app over MQTT. The current hardware
+version has no door-lock servo.
 
 ---
 
@@ -25,11 +25,10 @@ or a local Arduino sketch folder).
 
 - ESP32 DevKit V1 (the "brain" — replaces any Arduino Uno; Uno has no WiFi so it's not used in this project)
 - PIR motion sensor
-- LDR (photoresistor) light sensor
+- LDR module with a digital `DO` output (LM393-style comparator module)
 - 8x8 WS2812 NeoPixel matrix
 - Piezo buzzer
 - 2x LED (1 red = deterrent indicator, 1 green = WiFi status) + 2x 220Ω resistors
-- SG90 (or similar) servo — coop door lock/latch
 - Pushbutton (manual trigger/test)
 
 ## 3. Pinout (ESP32 DevKit V1)
@@ -38,14 +37,25 @@ or a local Arduino sketch folder).
 |---|---|---|
 | PIR OUT | GPIO 27 | digital input |
 | Pushbutton | GPIO 26 | `INPUT_PULLUP`, other leg to GND |
-| LDR AO | GPIO 34 | ADC1-only input, analog read (0–4095) |
+| LDR DO | GPIO 34 | digital input; use the module trimmer to set the night threshold |
 | NeoPixel Matrix DIN | GPIO 5 | WS2812, driven via Adafruit_NeoPixel |
 | Deterrent LED (red) | GPIO 25 | through 220Ω resistor |
 | WiFi status LED (green) | GPIO 2 | through 220Ω resistor |
 | Buzzer | GPIO 33 | driven with `tone()`/`noTone()` |
-| Servo (door lock) | GPIO 32 | PWM via ESP32Servo |
 
-Power: PIR and matrix run off ESP32's `5V` pin; LDR and other 3.3V-tolerant parts off `3V3`. Multiple `GND` pins are used (`GND.1`, `GND.2`, `GND.3`) — all commons, just spread across the board's ground pins in the diagram.
+Power in Wokwi is shown from the ESP32 pins. **For the physical build, do not power
+the 8x8 matrix from the ESP32's 5V/USB pin.** Use a regulated 5V supply rated for at
+least 4A, connect that supply directly to matrix `VDD` and `GND`, and connect its GND
+to ESP32 GND (a common ground is required). Keep the 330Ω data resistor; add a
+1000µF electrolytic capacitor across matrix 5V/GND near the matrix. A 74AHCT125 or
+74HCT125 3.3V-to-5V level shifter on the matrix data wire is strongly recommended
+for reliable real-world WS2812 operation.
+
+The diagram uses the common HC-SR501 arrangement: PIR powered from 5V, with its 3.3V
+`OUT` signal connected directly to GPIO27. Before wiring a different physical PIR,
+check its datasheet. If its `OUT` signal is genuinely 5V, use a proper 3.3V logic-level
+shifter; ESP32 GPIO pins are not 5V tolerant. Multiple `GND` pins (`GND.1`, `GND.2`,
+`GND.3`) are all common ground points.
 
 ---
 
@@ -54,14 +64,13 @@ Power: PIR and matrix run off ESP32's `5V` pin; LDR and other 3.3V-tolerant part
 1. Create a new Wokwi ESP32 project (or open this one if shared as a project link).
 2. Make sure `diagram.json`, `sketch.ino`, and `libraries.txt` are all present.
 3. Press the green "Play" (▶) button to build and run.
-4. Wokwi reads `libraries.txt` and auto-installs `PubSubClient`, `Adafruit NeoPixel`, and `ESP32Servo` before compiling — no manual steps needed in the simulator.
+4. Wokwi reads `libraries.txt` and auto-installs `PubSubClient` and `Adafruit NeoPixel` before compiling — no manual steps needed in the simulator.
 5. Wokwi's simulated WiFi has real internet access, so MQTT will actually connect if your broker is reachable from the internet (see Section 6).
 
 **If you get `fatal error: <Library>.h: No such file or directory`:** it means `libraries.txt` is missing, misspelled, or not in the same folder — double check it contains exactly:
 ```
 PubSubClient
 Adafruit NeoPixel
-ESP32Servo
 ```
 
 ## 5. Running on Real ESP32 Hardware (Arduino IDE)
@@ -71,11 +80,13 @@ ESP32Servo
 3. Install libraries via **Sketch → Include Library → Manage Libraries**:
    - `PubSubClient` (Nick O'Leary)
    - `Adafruit NeoPixel` (Adafruit)
-   - `ESP32Servo` (Kevin Harrington / John K. Bennett)
-4. Wire the hardware exactly per the pinout table in Section 3.
-5. Edit the config block at the top of the sketch (Section 6 below) with your real WiFi and MQTT details.
-6. Select the correct COM port under **Tools → Port**, then Upload.
-7. Open **Tools → Serial Monitor** at `115200` baud to watch connection/status logs.
+4. For Arduino IDE, put `smart_coop_deterrent.ino` in a folder named
+   `smart_coop_deterrent` before opening it. Arduino sketches require the main `.ino`
+   file and its folder to have the same name.
+5. Wire the hardware exactly per the pinout table in Section 3.
+6. Edit the config block at the top of the sketch (Section 6 below) with your real WiFi and MQTT details.
+7. Select the correct COM port under **Tools → Port**, then Upload.
+8. Open **Tools → Serial Monitor** at `115200` baud to watch connection/status logs.
 
 ---
 
@@ -94,13 +105,10 @@ const char* MQTT_USER     = "coop_device";
 const char* MQTT_PASS     = "YOUR_STRONG_PASSWORD";
 ```
 
-Also worth tuning once you test with the real LDR in your environment:
-
-```cpp
-#define LDR_DARK_THRESHOLD 1500   // lower = only triggers "dark" mode in near-total darkness
-```
-
-Raise or lower this depending on how bright your coop's surroundings are at dusk — watch the `coop/status/light` MQTT value (or Serial Monitor) at different times of day and set the threshold roughly halfway between your daytime and nighttime readings.
+For the LDR module, set the small onboard trimmer to choose its dark/light switching
+point. Then run the sketch's `status` serial command while covering and uncovering
+the sensor. Set `LDR_DARK_WHEN_HIGH` in the sketch to match the result. Wokwi's LDR
+module outputs HIGH in darkness by default.
 
 ---
 
@@ -152,19 +160,17 @@ You should see status messages appear once the ESP32 boots and connects.
 | Topic | Payload | Meaning |
 |---|---|---|
 | `coop/status/pir` | `"0"` / `"1"` | current motion sensor state |
-| `coop/status/light` | integer `0–4095` | raw LDR reading |
+| `coop/status/light` | `"0"` / `"1"` | interpreted light state: `"1"` = dark |
 | `coop/status/armed` | `"0"` / `"1"` | is the deterrent system armed (dark/night or app-forced) |
-| `coop/status/door` | `"open"` / `"closed"` | current door position |
 | `coop/alert/predator` | `"1"` | fired once per deterrent trigger event (motion detected while armed) |
 | `coop/status/online` | `"1"` (retained); `"0"` on unexpected disconnect (LWT) | device connectivity status — use this to show "online/offline" in the app |
 
-Status topics are published every ~5 seconds, plus immediately on state changes (door open/close, alerts).
+Status topics are published every ~5 seconds.
 
 ### Subscribed by the device (app → device)
 
 | Topic | Payload | Effect |
 |---|---|---|
-| `coop/cmd/door` | `"open"` / `"close"` | manually open or close/lock the coop door |
 | `coop/cmd/deterrent` | `"trigger"` | force-fire the lights/buzzer/matrix immediately, regardless of armed state |
 | `coop/cmd/arm` | `"auto"` / `"on"` / `"off"` | `auto` = system decides based on darkness (default); `on`/`off` = app overrides arming manually |
 
@@ -174,10 +180,10 @@ The app should subscribe to `coop/status/#` and `coop/alert/#` for a live dashbo
 
 ## 9. Behavior Logic Summary
 
-1. **Day/night detection:** LDR reading below `LDR_DARK_THRESHOLD` = "dark" → system auto-arms and closes the door.
+1. **Day/night detection:** the LDR module's `DO` pin indicates darkness → system auto-arms.
 2. **Motion while armed:** PIR trigger → deterrent fires: red LED on, buzzer tone, fast strobing "eyes" on the matrix, for `DETERRENT_DURATION_MS` (default 5 seconds). A `coop/alert/predator` message is published once per trigger, with a cooldown (`TRIGGER_COOLDOWN_MS`, default 3s) so it doesn't spam re-triggers from the same event.
 3. **Manual button press:** debounced and edge-triggered (won't repeat-fire if held down) — always fires the deterrent regardless of armed state (useful for testing), plus gives a brief white-flash acknowledgement on the matrix so you know the press registered.
-4. **App override:** `coop/cmd/arm` can force arming on/off regardless of light level; `coop/cmd/door` and `coop/cmd/deterrent` give direct manual control any time.
+4. **App override:** `coop/cmd/arm` can force arming on/off regardless of light level; `coop/cmd/deterrent` gives a direct manual test trigger any time.
 
 ## 9b. Matrix Display States (System "Face")
 
@@ -188,7 +194,6 @@ The 8x8 matrix acts as an at-a-glance status display, so someone checking on the
 | Booting | Slow blue dot circling the border | WiFi/MQTT still connecting |
 | Disarmed idle | Dim static "sun" glyph | Daytime, watching but not armed |
 | Armed idle | Soft "breathing" blue moon (slow brightness pulse) | Nighttime, actively protecting, calm state |
-| Door moving | Blinking yellow arrows (~0.9s) | Servo is opening/closing the door |
 | Alert | Fast strobing red "eyes", full brightness | Predator detected — this is the actual deterrent effect |
 | (any state) | Brief full white flash overlay | Confirms a manual button press was registered |
 
@@ -203,7 +208,7 @@ The WiFi status LED also communicates connection stages: slow blink = no WiFi, f
 | `fatal error: PubSubClient.h: No such file or directory` | Missing `libraries.txt` (Wokwi) or libraries not installed (Arduino IDE) — see Section 4/5. |
 | ESP32 won't connect to WiFi | Check `WIFI_SSID`/`WIFI_PASSWORD` spelling; ESP32 only supports 2.4GHz networks, not 5GHz. |
 | MQTT won't connect, `rc=` error printed in Serial Monitor | Check broker IP/port reachability, and that `MQTT_USER`/`MQTT_PASS` match what you created with `mosquitto_passwd`. Common `rc` codes: `-2` = network unreachable, `5` = not authorized (bad credentials). |
-| Door never closes at night | `LDR_DARK_THRESHOLD` may be miscalibrated for your environment — check `coop/status/light` values at night vs. day and adjust. |
+| System arms in bright light or stays disarmed in darkness | `LDR_DARK_WHEN_HIGH` is backwards, or the module trimmer threshold needs adjustment. Use the `status` serial command while covering/uncovering the sensor. |
 | Deterrent never fires | Confirm `armed` is true (check `coop/status/armed`), and that the PIR sensor's sensitivity/delay potentiometers (on real hardware) aren't set too low/long. |
 | App shows device "offline" even though it's running | Broker LWT (`coop/status/online`) only flips to `1` after a successful MQTT connect — check WiFi/MQTT connection logs in Serial Monitor. |
 
