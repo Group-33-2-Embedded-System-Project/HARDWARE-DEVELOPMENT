@@ -1,7 +1,7 @@
 import { Server } from 'socket.io';
 import { config } from './config.js';
-import { snapshot } from './state.js';
 import logger from './logger.js';
+import { buildStatusView } from './statusView.js';
 
 let io;
 let connectedClients = new Map();
@@ -35,7 +35,7 @@ export function createSocketServer(server) {
 
     // Send current status immediately upon connection
     try {
-      socket.emit('status_update', snapshot());
+      socket.emit('status_update', buildStatusView());
     } catch (error) {
       logger.error('Failed to send initial status', error, { clientId });
     }
@@ -87,7 +87,7 @@ export function emitStatus() {
   }
 
   try {
-    const statusData = snapshot();
+    const statusData = buildStatusView();
     io.emit('status_update', statusData);
     logger.debug('Status emitted to clients', {
       clientCount: connectedClients.size

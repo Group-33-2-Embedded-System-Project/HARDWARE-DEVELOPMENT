@@ -6,12 +6,57 @@ import LoginForm from './components/LoginForm.jsx';
 import StatusDashboard from './components/StatusDashboard.jsx';
 import ArmControl from './components/ArmControl.jsx';
 import EventHistory from './components/EventHistory.jsx';
+import RecentCommands from './components/RecentCommands.jsx';
 import AlertBanner from './components/AlertBanner.jsx';
 import SystemHealth from './components/SystemHealth.jsx';
 import ErrorBoundary from './components/ErrorBoundary.jsx';
 import OfflineBanner from './components/OfflineBanner.jsx';
 
-const emptyStatus = { pir: false, light: false, armed: false, online: false, updatedAt: null };
+const emptyStatus = {
+  pir: false,
+  light: false,
+  armed: false,
+  online: false,
+  updatedAt: null,
+  receivedAt: null,
+  reportedAt: null,
+  isStale: true,
+  lastDeviceMessageAt: null,
+  staleAfterMs: null,
+  mqttConnected: false,
+  commandSummary: { latest: null, pendingCount: 0 },
+};
+
+function normalizeStatusPayload(payload) {
+  if (!payload) return emptyStatus;
+
+  if (payload.device) {
+    return {
+      pir: Boolean(payload.device.pir),
+      light: Boolean(payload.device.light),
+      armed: Boolean(payload.device.armed),
+      online: Boolean(payload.device.online),
+      updatedAt: payload.device.updatedAt ?? payload.device.receivedAt ?? null,
+      receivedAt: payload.device.receivedAt ?? null,
+      reportedAt: payload.device.reportedAt ?? null,
+      isStale: payload.device.freshness?.isStale ?? true,
+      lastDeviceMessageAt: payload.device.freshness?.lastDeviceMessageAt ?? null,
+      staleAfterMs: payload.device.freshness?.staleAfterMs ?? null,
+      mqttConnected: Boolean(payload.backend?.mqttConnected),
+      commandSummary: payload.commands || { latest: null, pendingCount: 0 },
+    };
+  }
+
+  return {
+    ...emptyStatus,
+    ...payload,
+    pir: Boolean(payload.pir),
+    light: Boolean(payload.light),
+    armed: Boolean(payload.armed),
+    online: Boolean(payload.online),
+    isStale: false,
+  };
+}
 
 function urlBase64ToUint8Array(base64) {
   const padded = `${base64}${'='.repeat((4 - base64.length % 4) % 4)}`
@@ -26,6 +71,7 @@ export default function App() {
   );
   const [status, setStatus]   = useState(emptyStatus);
   const [events, setEvents]   = useState([]);
+  const [commands, setCommands] = useState([]);
   const [alert, setAlert]     = useState(null);
   const [notice, setNotice]   = useState('');
   const [busy, setBusy]       = useState(false);
@@ -89,21 +135,33 @@ export default function App() {
     }
   }
 
+  async function loadCommands(tok, refresh) {
+    const t = tok ?? sessionRef.current?.token;
+    const r = refresh ?? sessionRef.current?.refreshToken;
+    if (!t) return;
+    try {
+      setCommands((await api.commands(t, r, onTokenRefreshed)).commands);
+    } catch (error) {
+      handleAuthError(error);
+    }
+  }
+
   useEffect(() => {
-    api.status().then(setStatus).catch(() => setNotice('Unable to reach the backend.'));
+    api.status().then((data) => setStatus(normalizeStatusPayload(data))).catch(() => setNotice('Unable to reach the backend.'));
 
     const disconnect = connectSocket({
-      onStatus: setStatus,
+      onStatus: (data) => setStatus(normalizeStatusPayload(data)),
       onAlert: (payload) => {
         setAlert(payload);
         loadEvents();
+        loadCommands();
       },
       onConnectionChange: (state) => {
         setConnectionState(state);
         if (!state.connected && state.reconnecting && state.attempt > 3) {
           setNotice(`Reconnecting to server… (attempt ${state.attempt})`);
         } else if (state.connected && connectionState.reconnecting) {
-          api.status().then(setStatus).catch(console.error);
+          api.status().then((data) => setStatus(normalizeStatusPayload(data))).catch(console.error);
           setNotice('Connection restored');
           setTimeout(() => setNotice(''), 3000);
         }
@@ -117,6 +175,7 @@ export default function App() {
   useEffect(() => {
     if (session) {
       loadEvents(session.token, session.refreshToken);
+      loadCommands(session.token, session.refreshToken);
       enablePush(session.token, session.refreshToken);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -157,6 +216,9 @@ export default function App() {
       }
       setNotice(action === 'trigger' ? 'Deterrent test command sent.' : `Arm mode set to "${action}".`);
       await loadEvents();
+      await loadCommands();
+      const latest = await api.status();
+      setStatus(normalizeStatusPayload(latest));
     } catch (error) {
       handleAuthError(error);
     } finally {
@@ -168,6 +230,7 @@ export default function App() {
     localStorage.removeItem('coop-session');
     setSession(null);
     setEvents([]);
+    setCommands([]);
   }
 
   async function deleteLog(id) {
@@ -301,6 +364,10 @@ export default function App() {
 
           <ErrorBoundary label="Event history">
             <EventHistory events={events} loading={loadingEvents} onDeleteEvent={deleteLog} onClearEvents={clearLogs} />
+          </ErrorBoundary>
+
+          <ErrorBoundary label="Recent commands">
+            <RecentCommands commands={commands} session={session} onTokenRefreshed={onTokenRefreshed} />
           </ErrorBoundary>
 
           <ErrorBoundary label="System health">

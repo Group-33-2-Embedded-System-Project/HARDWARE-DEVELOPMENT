@@ -11,11 +11,24 @@ function formatUptime(seconds) {
   return `${s}s uptime`;
 }
 
+function formatAge(isoString) {
+  if (!isoString) return 'No device contact yet';
+  const diffMs = Math.max(0, Date.now() - new Date(isoString).getTime());
+  const seconds = Math.floor(diffMs / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m ago`;
+}
+
 function CheckRow({ label, check, icon: Icon }) {
   if (!check) return null;
 
   let displayValue = '';
   if (check.latencyMs != null) displayValue = `${check.latencyMs} ms`;
+  else if (check.pendingCount != null) displayValue = `${check.pendingCount} pending`;
+  else if (check.totalMessages != null) displayValue = `${check.totalMessages} msgs`;
   else if (check.connectedClients != null) displayValue = `${check.connectedClients} client${check.connectedClients !== 1 ? 's' : ''}`;
   else if (check.uptimeSeconds != null) displayValue = formatUptime(check.uptimeSeconds);
   else if (check.status === 'error') displayValue = check.error || 'Error';
@@ -80,6 +93,10 @@ export default function SystemHealth({ session, onTokenRefreshed }) {
   const fetchTime = lastFetch
     ? lastFetch.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
     : null;
+  const deviceCheck = health?.checks?.device;
+  const deviceFreshnessLabel = deviceCheck?.lastDeviceMessageAt
+    ? formatAge(deviceCheck.lastDeviceMessageAt)
+    : 'No device contact yet';
 
   return (
     <section className="panel-card" aria-label="System health">
@@ -126,6 +143,16 @@ export default function SystemHealth({ session, onTokenRefreshed }) {
         )}
       </div>
 
+      {health?.checks?.device && (
+        <div className="health-memory" aria-label="Device freshness">
+          <span>Device contact {deviceFreshnessLabel}</span>
+          <span>{deviceCheck.isStale ? 'State stale' : deviceCheck.online ? 'State fresh' : 'Device offline'}</span>
+          {deviceCheck.staleAfterMs != null && (
+            <span>Stale after {Math.floor(deviceCheck.staleAfterMs / 1000)}s</span>
+          )}
+        </div>
+      )}
+
       {/* Expanded checks */}
       {expanded && health && (
         <div id="health-details" aria-label="Health check details">
@@ -134,6 +161,8 @@ export default function SystemHealth({ session, onTokenRefreshed }) {
             <CheckRow label="MQTT"       check={health.checks?.mqtt}       icon={Radio}        />
             <CheckRow label="WebSocket"  check={health.checks?.websocket}  icon={Plugs}        />
             <CheckRow label="Device"     check={health.checks?.device}     icon={DeviceMobile} />
+            <CheckRow label="Commands"   check={health.checks?.commands}   icon={ArrowClockwise} />
+            <CheckRow label="Ingest"     check={health.checks?.ingest}     icon={Radio}        />
             <CheckRow label="Process"    check={health.checks?.system}     icon={Cpu}          />
           </div>
 

@@ -30,8 +30,11 @@ export default function ArmControl({ onSelect, busy, session, onTokenRefreshed }
     async function fetchStatus() {
       if (!session?.token) return;
       try {
-        const data = await api.status(session.token, session.refreshToken, onTokenRefreshed);
-        setArmMode(data.mode);
+        const data = await api.status();
+        const latestMode = data?.commands?.latest?.type === 'arm'
+          ? data.commands.latest.payload_json?.mode
+          : null;
+        setArmMode(latestMode);
       } catch {
         // Fail silently — arm mode will update when user selects
       }

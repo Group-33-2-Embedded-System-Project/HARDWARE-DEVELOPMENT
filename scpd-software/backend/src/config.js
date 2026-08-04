@@ -12,6 +12,8 @@ export const config = {
   frontendOrigins: (process.env.FRONTEND_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173')
     .split(',').map((origin) => origin.trim()).filter(Boolean),
   databasePath: process.env.DATABASE_PATH || './data/coop.db',
+  deviceStateStaleAfterMs: Number(process.env.DEVICE_STATE_STALE_AFTER_MS || 15000),
+  commandAckTimeoutMs: Number(process.env.COMMAND_ACK_TIMEOUT_MS || 15000),
   jwtSecret: process.env.JWT_SECRET || 'development-only-secret-change-me',
   adminUsername: process.env.ADMIN_USERNAME || 'admin',
   adminPassword: process.env.ADMIN_PASSWORD || 'change-me',

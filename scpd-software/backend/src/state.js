@@ -1,168 +1,282 @@
 import { db } from './db/index.js';
+import { config } from './config.js';
 import logger from './logger.js';
 
-// In-memory cache of current state
-let statusCache = { pir: false, light: false, armed: false, online: false, updatedAt: null };
+const DEVICE_FIELDS = ['pir', 'light', 'armed', 'online', 'radar'];
+
+let deviceStateCache = {
+  pir: false,
+  light: false,
+  armed: false,
+  online: false,
+  radar: false,
+  threat_level: 0,
+  reportedAt: null,
+  receivedAt: null,
+  updatedAt: null,
+  lastDeviceMessageAt: null,
+};
+
 let isInitialized = false;
 
-/**
- * Initialize state from database on startup
- */
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function coerceTimestamp(value, fallback = null) {
+  if (!value) return fallback;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? fallback : date.toISOString();
+}
+
+function deriveFreshness(lastDeviceMessageAt = deviceStateCache.lastDeviceMessageAt) {
+  if (!lastDeviceMessageAt) {
+    return {
+      lastDeviceMessageAt: null,
+      staleAfterMs: config.deviceStateStaleAfterMs,
+      ageMs: null,
+      isStale: true,
+    };
+  }
+
+  const ageMs = Math.max(0, Date.now() - new Date(lastDeviceMessageAt).getTime());
+  return {
+    lastDeviceMessageAt,
+    staleAfterMs: config.deviceStateStaleAfterMs,
+    ageMs,
+    isStale: ageMs > config.deviceStateStaleAfterMs,
+  };
+}
+
+function persistProjection(field, value, changedAt, oldValue, newValue, { writeHistory }) {
+  // Boolean-style fields (0/1) are handled here
+  const updateProjection = db.prepare(`
+    UPDATE system_state
+    SET ${field} = ?, updated_at = ?
+    WHERE id = 1
+  `);
+
+  const insertHistory = db.prepare(`
+    INSERT INTO state_history (field, old_value, new_value, changed_at)
+    VALUES (?, ?, ?, ?)
+  `);
+
+  const transaction = db.transaction(() => {
+    updateProjection.run(value ? 1 : 0, changedAt);
+
+    if (writeHistory) {
+      insertHistory.run(field, String(oldValue), String(newValue), changedAt);
+    }
+  });
+
+  transaction();
+}
+
+function persistNumericProjection(field, numericValue, changedAt, oldValue, newValue, { writeHistory }) {
+  // Use this for numeric fields like threat_level where exact value must be stored
+  const updateProjection = db.prepare(`
+    UPDATE system_state
+    SET ${field} = ?, updated_at = ?
+    WHERE id = 1
+  `);
+
+  const insertHistory = db.prepare(`
+    INSERT INTO state_history (field, old_value, new_value, changed_at)
+    VALUES (?, ?, ?, ?)
+  `);
+
+  const transaction = db.transaction(() => {
+    updateProjection.run(numericValue, changedAt);
+
+    if (writeHistory) {
+      insertHistory.run(field, String(oldValue), String(newValue), changedAt);
+    }
+  });
+
+  transaction();
+}
+
 export function initializeState() {
   if (isInitialized) return;
-  
+
   try {
     const row = db.prepare('SELECT * FROM system_state WHERE id = 1').get();
     if (row) {
-      statusCache = {
+      const timestamp = coerceTimestamp(row.updated_at);
+      deviceStateCache = {
         pir: Boolean(row.pir),
         light: Boolean(row.light),
         armed: Boolean(row.armed),
         online: Boolean(row.online),
-        updatedAt: row.updated_at
+        radar: Boolean(row.radar),
+        threat_level: Number.isInteger(row.threat_level) ? row.threat_level : 0,
+        reportedAt: timestamp,
+        receivedAt: timestamp,
+        updatedAt: timestamp,
+        lastDeviceMessageAt: timestamp,
       };
-      logger.info('State initialized from database', statusCache);
+      logger.info('State initialized from database', deviceStateCache);
     }
-    isInitialized = true;
   } catch (error) {
     logger.error('Failed to initialize state from database', error);
-    // Continue with default state
+  } finally {
     isInitialized = true;
   }
 }
 
-/**
- * Update a state field with persistence and history tracking
- */
-export function updateState(field, value) {
-  if (!['pir', 'light', 'armed', 'online'].includes(field)) {
+export function recordDeviceContact(receivedAt = nowIso()) {
+  const timestamp = coerceTimestamp(receivedAt, nowIso());
+  deviceStateCache.receivedAt = timestamp;
+  deviceStateCache.updatedAt = timestamp;
+  deviceStateCache.lastDeviceMessageAt = timestamp;
+  return timestamp;
+}
+
+export function updateState(field, value, metadata = {}) {
+  if (!DEVICE_FIELDS.includes(field)) {
     throw new Error(`Invalid state field: ${field}`);
   }
 
-  const oldValue = statusCache[field];
+  const oldValue = deviceStateCache[field];
   const newValue = Boolean(value);
-  
-  // No change, skip update
-  if (oldValue === newValue) return false;
+  const receivedAt = recordDeviceContact(metadata.receivedAt);
+  const reportedAt = coerceTimestamp(metadata.reportedAt, receivedAt);
 
-  const now = new Date().toISOString();
-  statusCache[field] = newValue;
-  statusCache.updatedAt = now;
+  deviceStateCache.reportedAt = reportedAt;
+
+  const changed = oldValue !== newValue;
+  deviceStateCache[field] = newValue;
 
   try {
-    // Use transaction for atomicity
-    const updateState = db.prepare(`
-      UPDATE system_state 
-      SET ${field} = ?, updated_at = ? 
-      WHERE id = 1
-    `);
-    
-    const insertHistory = db.prepare(`
-      INSERT INTO state_history (field, old_value, new_value, changed_at)
-      VALUES (?, ?, ?, ?)
-    `);
-
-    const transaction = db.transaction(() => {
-      updateState.run(newValue ? 1 : 0, now);
-      insertHistory.run(field, String(oldValue), String(newValue), now);
-    });
-
-    transaction();
-    
-    logger.debug('State updated', {
-      field,
-      oldValue,
-      newValue
-    });
-    return true;
+    persistProjection(field, newValue, receivedAt, oldValue, newValue, { writeHistory: changed });
+    if (changed) {
+      logger.debug('State updated', { field, oldValue, newValue, receivedAt, reportedAt });
+    }
+    return changed;
   } catch (error) {
     logger.error('Failed to persist state update', error, { field, oldValue, newValue });
-    // Rollback in-memory state on failure
-    statusCache[field] = oldValue;
+    deviceStateCache[field] = oldValue;
     throw error;
   }
 }
 
 /**
- * Bulk update multiple state fields
+ * Update numeric threat level (0..3)
  */
-export function updateStateFields(updates) {
+export function updateThreatLevel(level, metadata = {}) {
+  const parsed = Number(level);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error('Invalid threat level');
+  }
+
+  const oldValue = deviceStateCache.threat_level;
+  const newValue = parsed;
+  const receivedAt = recordDeviceContact(metadata.receivedAt);
+  const reportedAt = coerceTimestamp(metadata.reportedAt, receivedAt);
+
+  deviceStateCache.reportedAt = reportedAt;
+  deviceStateCache.threat_level = newValue;
+
+  const changed = oldValue !== newValue;
+  try {
+    persistNumericProjection('threat_level', newValue, receivedAt, oldValue, newValue, { writeHistory: changed });
+    if (changed) {
+      logger.debug('Threat level updated', { oldValue, newValue, receivedAt, reportedAt });
+    }
+    return changed;
+  } catch (error) {
+    logger.error('Failed to persist threat level', error, { oldValue, newValue });
+    deviceStateCache.threat_level = oldValue;
+    throw error;
+  }
+}
+
+export function updateStateFields(updates, metadata = {}) {
+  const receivedAt = recordDeviceContact(metadata.receivedAt);
+  const reportedAt = coerceTimestamp(metadata.reportedAt, receivedAt);
   const changes = [];
-  const now = new Date().toISOString();
-  
+  const rollback = [];
+
   try {
     const transaction = db.transaction(() => {
       for (const [field, value] of Object.entries(updates)) {
-        if (!['pir', 'light', 'armed', 'online'].includes(field)) continue;
-        
-        const oldValue = statusCache[field];
+        if (!DEVICE_FIELDS.includes(field)) continue;
+
+        const oldValue = deviceStateCache[field];
         const newValue = Boolean(value);
-        
-        if (oldValue === newValue) continue;
-        
-        statusCache[field] = newValue;
-        changes.push({ field, oldValue, newValue });
-        
-        db.prepare(`UPDATE system_state SET ${field} = ?, updated_at = ? WHERE id = 1`)
-          .run(newValue ? 1 : 0, now);
-        
-        db.prepare(`INSERT INTO state_history (field, old_value, new_value, changed_at) VALUES (?, ?, ?, ?)`)
-          .run(field, String(oldValue), String(newValue), now);
+        const changed = oldValue !== newValue;
+
+        rollback.push({ field, oldValue });
+        deviceStateCache[field] = newValue;
+
+        persistProjection(field, newValue, receivedAt, oldValue, newValue, { writeHistory: changed });
+
+        if (changed) {
+          changes.push({ field, oldValue, newValue });
+        }
       }
-      
-      statusCache.updatedAt = now;
     });
 
     transaction();
-    
+    deviceStateCache.reportedAt = reportedAt;
+
     if (changes.length > 0) {
       logger.info('Bulk state update', {
         changedFields: changes.length,
-        changes
+        changes,
+        receivedAt,
+        reportedAt,
       });
     }
-    
+
     return changes.length > 0;
   } catch (error) {
     logger.error('Failed to persist bulk state update', error);
-    // Rollback all changes
-    changes.forEach(({ field, oldValue }) => {
-      statusCache[field] = oldValue;
+    rollback.forEach(({ field, oldValue }) => {
+      deviceStateCache[field] = oldValue;
     });
     throw error;
   }
 }
 
-/**
- * Get current state snapshot
- */
 export function snapshot() {
-  return { ...statusCache };
+  const freshness = deriveFreshness();
+
+  return {
+    ...deviceStateCache,
+    freshness,
+  };
 }
 
-/**
- * Update state directly from MQTT or startup synchronization.
- */
-export function syncStateFromSource(updates) {
-  return updateStateFields(updates);
+export function snapshotLegacy() {
+  return {
+    pir: deviceStateCache.pir,
+    light: deviceStateCache.light,
+    armed: deviceStateCache.armed,
+    online: deviceStateCache.online,
+    radar: deviceStateCache.radar,
+    threat_level: deviceStateCache.threat_level,
+    updatedAt: deviceStateCache.updatedAt,
+  };
 }
 
-/**
- * Get state history for a specific field
- */
+export function syncStateFromSource(updates, metadata = {}) {
+  return updateStateFields(updates, metadata);
+}
+
 export function getStateHistory(field = null, limit = 100) {
   try {
     let query = 'SELECT * FROM state_history';
     const params = [];
-    
+
     if (field) {
       query += ' WHERE field = ?';
       params.push(field);
     }
-    
+
     query += ' ORDER BY changed_at DESC LIMIT ?';
     params.push(limit);
-    
+
     return db.prepare(query).all(...params);
   } catch (error) {
     logger.error('Failed to fetch state history', error, { field, limit });
@@ -170,15 +284,12 @@ export function getStateHistory(field = null, limit = 100) {
   }
 }
 
-/**
- * Legacy access to status object (for backwards compatibility)
- */
-export const status = new Proxy(statusCache, {
+export const status = new Proxy(deviceStateCache, {
   get(target, prop) {
     return target[prop];
   },
   set(target, prop, value) {
-    if (['pir', 'light', 'armed', 'online'].includes(prop)) {
+    if (DEVICE_FIELDS.includes(prop)) {
       logger.warn('Direct state mutation detected', { field: prop });
       updateState(prop, value);
       return true;

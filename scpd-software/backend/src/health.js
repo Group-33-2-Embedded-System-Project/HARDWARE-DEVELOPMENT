@@ -2,6 +2,8 @@ import { db } from './db/index.js';
 import { getMqttStatus } from './mqtt/client.js';
 import { getSocketStats } from './sockets.js';
 import { snapshot } from './state.js';
+import { getLatestCommandSummary } from './commands.js';
+import { getDeviceMessageStats } from './deviceMessages.js';
 import logger from './logger.js';
 
 const startTime = Date.now();
@@ -83,11 +85,44 @@ function checkSystem() {
  */
 function checkDevice() {
   const state = snapshot();
+  const freshness = state.freshness;
+  const stale = freshness.isStale;
+
   return {
-    status: state.online ? 'ok' : 'degraded',
+    status: state.online && !stale ? 'ok' : 'degraded',
     online: state.online,
     armed:  state.armed,
     lastUpdated: state.updatedAt,
+    lastDeviceMessageAt: freshness.lastDeviceMessageAt,
+    staleAfterMs: freshness.staleAfterMs,
+    isStale: stale,
+  };
+}
+
+function checkCommandQueue() {
+  const summary = getLatestCommandSummary();
+  return {
+    status: summary.pendingCount > 0 ? 'degraded' : 'ok',
+    pendingCount: summary.pendingCount,
+    latest: summary.latest
+      ? {
+          id: summary.latest.id,
+          type: summary.latest.type,
+          publishStatus: summary.latest.publish_status,
+          ackStatus: summary.latest.ack_status,
+          requestedAt: summary.latest.requested_at,
+        }
+      : null,
+  };
+}
+
+function checkDeviceMessageIngest() {
+  const stats = getDeviceMessageStats();
+  return {
+    status: stats.parseFailures > 0 ? 'degraded' : 'ok',
+    totalMessages: stats.total,
+    parseFailures: stats.parseFailures,
+    lastReceivedAt: stats.lastReceivedAt,
   };
 }
 
@@ -113,6 +148,8 @@ export function getDetailedHealth() {
     mqtt:      checkMqtt(),
     websocket: checkWebSocket(),
     device:    checkDevice(),
+    commands:  checkCommandQueue(),
+    ingest:    checkDeviceMessageIngest(),
     system:    checkSystem(),
   };
 

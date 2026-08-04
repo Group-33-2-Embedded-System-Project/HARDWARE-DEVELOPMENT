@@ -25,13 +25,35 @@ const EVENT_META = {
     label: 'State Error',
     icon:  Warning,
   },
+  alert_processing_error: {
+    label: 'Alert Processing Error',
+    icon: Warning,
+  },
+  mqtt_unknown_topic: {
+    label: 'Unhandled MQTT Topic',
+    icon: Warning,
+  },
+  mqtt_handler_error: {
+    label: 'MQTT Handler Error',
+    icon: Warning,
+  },
 };
 
 function formatDate(isoString) {
-  const d = new Date(`${isoString}Z`);
+  const d = new Date(isoString);
   const date = d.toLocaleDateString([], { month: 'short', day: 'numeric' });
   const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   return { date, time };
+}
+
+function formatSource(source) {
+  if (!source) return 'Unknown';
+  return source.charAt(0).toUpperCase() + source.slice(1);
+}
+
+function formatSeverity(severity) {
+  if (!severity) return 'Info';
+  return severity.charAt(0).toUpperCase() + severity.slice(1);
 }
 
 function SkeletonRow() {
@@ -100,7 +122,8 @@ export default function EventHistory({ events, loading, onDeleteEvent, onClearEv
               const meta = EVENT_META[event.type];
               const Icon = meta?.icon ?? Warning;
               const label = meta?.label ?? event.type;
-              const { date, time } = formatDate(event.created_at);
+              const eventTime = event.backend_received_at || event.created_at;
+              const { date, time } = formatDate(eventTime);
 
               return (
                 <li key={event.id} className="event-item">
@@ -113,7 +136,9 @@ export default function EventHistory({ events, loading, onDeleteEvent, onClearEv
                   </div>
                   <div className="event-body">
                     <span className="event-title">{label}</span>
-                    <span className="event-sub">{date}</span>
+                    <span className="event-sub">
+                      {date} · {formatSource(event.source)} · {formatSeverity(event.severity)}
+                    </span>
                   </div>
                   <div className="event-meta-actions">
                     <span className="event-time">{time}</span>

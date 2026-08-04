@@ -1,11 +1,12 @@
 import { Router } from 'express';
-import { snapshot, getStateHistory } from '../state.js';
+import { getStateHistory } from '../state.js';
 import { authenticate } from '../auth.js';
 import { validateQuery } from '../middleware/validation.js';
+import { buildStatusView } from '../statusView.js';
 
 const router = Router();
 
-router.get('/', (_req, res) => res.json(snapshot()));
+router.get('/', (_req, res) => res.json(buildStatusView()));
 
 // State history endpoint (authenticated)
 router.get('/history', authenticate, validateQuery('statusHistory'), (req, res) => {

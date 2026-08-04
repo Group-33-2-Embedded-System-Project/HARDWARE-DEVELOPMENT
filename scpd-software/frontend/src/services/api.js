@@ -41,7 +41,7 @@ async function request(path, options = {}) {
  */
 async function tryRefresh(refreshToken) {
   try {
-    const body = await request('/api/auth/refresh', {
+    const body = await request('/api/v1/auth/refresh', {
       method: 'POST',
       headers: headers(null, true),
       body: JSON.stringify({ refreshToken }),
@@ -86,49 +86,91 @@ async function authRequest(path, options, token, refreshToken, onTokenRefreshed)
 
 export const api = {
   login: (username, password) =>
-    request('/api/auth/login', {
+    request('/api/v1/auth/login', {
       method:  'POST',
       headers: headers(null, true),
       body:    JSON.stringify({ username, password }),
     }),
 
   refreshToken: (refreshToken) =>
-    request('/api/auth/refresh', {
+    request('/api/v1/auth/refresh', {
       method:  'POST',
       headers: headers(null, true),
       body:    JSON.stringify({ refreshToken }),
     }),
 
-  status: () => request('/api/status'),
+  status: () => request('/api/v1/status'),
 
   events: (token, refreshToken, onRefresh) =>
-    authRequest('/api/events?limit=50', { headers: {} }, token, refreshToken, onRefresh),
+    authRequest('/api/v1/events?limit=50', { headers: {} }, token, refreshToken, onRefresh),
+
+  commands: (token, refreshToken, onRefresh) =>
+    authRequest('/api/v1/commands?limit=20', { headers: {} }, token, refreshToken, onRefresh),
+
+  command: (token, id, refreshToken, onRefresh) =>
+    authRequest(`/api/v1/commands/${id}`, { headers: {} }, token, refreshToken, onRefresh),
 
   deleteEvent: (token, id, refreshToken, onRefresh) =>
-    authRequest(`/api/events/${id}`, { method: 'DELETE' }, token, refreshToken, onRefresh),
+    authRequest(`/api/v1/events/${id}`, { method: 'DELETE' }, token, refreshToken, onRefresh),
 
   clearEvents: (token, refreshToken, onRefresh) =>
-    authRequest('/api/events', { method: 'DELETE' }, token, refreshToken, onRefresh),
+    authRequest('/api/v1/events', { method: 'DELETE' }, token, refreshToken, onRefresh),
 
+  // Commands
   trigger: (token, refreshToken, onRefresh) =>
     authRequest(
-      '/api/command/deterrent',
+      '/api/v1/commands/deterrent',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'trigger' }) },
       token, refreshToken, onRefresh
     ),
 
   arm: (token, mode, refreshToken, onRefresh) =>
     authRequest(
-      '/api/command/arm',
+      '/api/v1/commands/arm',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) },
       token, refreshToken, onRefresh
     ),
 
-  pushPublicKey: () => request('/api/push/public-key'),
+  pushPublicKey: () => request('/api/v1/push/public-key'),
 
   subscribePush: (token, subscription, refreshToken, onRefresh) =>
     authRequest(
-      '/api/push/subscribe',
+      '/api/v1/push/subscribe',
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(subscription) },
+      token, refreshToken, onRefresh
+    ),
+
+  health: () => request('/health'),
+
+  detailedHealth: (token, refreshToken, onRefresh) =>
+    authRequest('/health/detailed', { headers: {} }, token, refreshToken, onRefresh),
+
+  // --- New command delete APIs (authenticated)
+  deleteCommand: (token, id, refreshToken, onRefresh) =>
+    authRequest(`/api/v1/commands/${encodeURIComponent(id)}`, { method: 'DELETE' }, token, refreshToken, onRefresh),
+
+  deleteAllCommands: (token, refreshToken, onRefresh) =>
+    authRequest('/api/v1/commands', { method: 'DELETE' }, token, refreshToken, onRefresh),
+
+  trigger: (token, refreshToken, onRefresh) =>
+    authRequest(
+      '/api/v1/commands/deterrent',
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'trigger' }) },
+      token, refreshToken, onRefresh
+    ),
+
+  arm: (token, mode, refreshToken, onRefresh) =>
+    authRequest(
+      '/api/v1/commands/arm',
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) },
+      token, refreshToken, onRefresh
+    ),
+
+  pushPublicKey: () => request('/api/v1/push/public-key'),
+
+  subscribePush: (token, subscription, refreshToken, onRefresh) =>
+    authRequest(
+      '/api/v1/push/subscribe',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(subscription) },
       token, refreshToken, onRefresh
     ),

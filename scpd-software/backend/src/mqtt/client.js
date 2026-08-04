@@ -1,7 +1,6 @@
 import mqtt from 'mqtt';
 import { config } from '../config.js';
 import { handleMqttMessage } from './handlers.js';
-import { updateState } from '../state.js';
 import logger from '../logger.js';
 
 let client;
@@ -31,7 +30,7 @@ const MQTT_CONFIG = {
  * Subscribe to MQTT topics with error handling
  */
 function subscribeToTopics() {
-  const topics = ['coop/status/#', 'coop/alert/#'];
+  const topics = ['coop/status/#', 'coop/alert/#', 'coop/ack/#'];
   
   client.subscribe(topics, { qos: 1 }, (error, granted) => {
     if (error) {
@@ -60,14 +59,6 @@ function handleConnect() {
   
   // Subscribe to topics
   subscribeToTopics();
-
-  // Publish online status
-  try {
-    updateState('online', true);
-    client.publish('coop/status/online', '1', { qos: 1, retain: true });
-  } catch (error) {
-    logger.error('Failed to publish backend online status', error);
-  }
 }
 
 /**
@@ -77,13 +68,6 @@ function handleClose() {
   if (isConnected) {
     logger.warn('MQTT connection closed');
     isConnected = false;
-    
-    // Update internal state
-    try {
-      updateState('online', false);
-    } catch (error) {
-      logger.error('Failed to update online state', error);
-    }
   }
 }
 

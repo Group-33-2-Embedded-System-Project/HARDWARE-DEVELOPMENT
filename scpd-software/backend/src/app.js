@@ -16,6 +16,7 @@ import eventRoutes   from './routes/events.js';
 import commandRoutes from './routes/commands.js';
 import pushRoutes    from './routes/push.js';
 import healthRoutes  from './routes/health.js';
+import deviceMessagesRoutes from './routes/deviceMessages.js';
 
 const app = express();
 
@@ -47,6 +48,13 @@ app.use('/api/status',   statusRoutes);
 app.use('/api/events',   eventRoutes);
 app.use('/api/command',  commandRoutes);
 app.use('/api/push',     pushRoutes);
+app.use('/api/device-messages', deviceMessagesRoutes);
+app.use('/api/v1/auth', authRoutes);
+app.use('/api/v1/status', statusRoutes);
+app.use('/api/v1/events', eventRoutes);
+app.use('/api/v1/commands', commandRoutes);
+app.use('/api/v1/push', pushRoutes);
+app.use('/api/v1/device-messages', deviceMessagesRoutes);
 
 // ── Error handling ────────────────────────────────────────────────────────────
 app.use(errorLogger);

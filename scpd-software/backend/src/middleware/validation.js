@@ -17,6 +17,12 @@ const schemas = {
   arm: {
     mode: { type: 'string', enum: ['auto', 'on', 'off'] }
   },
+  commands: {
+    limit: { type: 'number', min: 1, max: 100, optional: true }
+  },
+  deviceMessages: {
+    limit: { type: 'number', min: 1, max: 200, optional: true }
+  },
   events: {
     limit: { type: 'number', min: 1, max: 1000, optional: true }
   },
