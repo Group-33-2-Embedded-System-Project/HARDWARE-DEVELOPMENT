@@ -36,7 +36,11 @@
 */
 
 #include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ESPmDNS.h>
 #include <PubSubClient.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/sha1.h>
 // Using a small MAX7219 driver (shiftOut) instead of LedControl — compatible with ESP32
 
 // ==================== USER CONFIG ====================
@@ -71,6 +75,7 @@ const char* TOPIC_CMD_ARM       = "coop/cmd/arm";
 #define PIN_BUZZER     33
 #define PIN_LED_RED    25
 #define PIN_LED_WIFI   2
+#define PIN_BATTERY    35
 
 // ==================== CONFIGURATION ====================
 #define MATRIX_ROWS 8
@@ -89,9 +94,9 @@ const char* TOPIC_CMD_ARM       = "coop/cmd/arm";
 #define BUTTON_ACK_MS 300
 #define BUTTON_ACK_BRIGHTNESS 40
 
-#define SIREN_MIN_HZ 800
-#define SIREN_MAX_HZ 2400
-#define SIREN_SWEEP_MS 400
+#define SIREN_MIN_HZ 900
+#define SIREN_MAX_HZ 2200
+#define SIREN_SWEEP_MS 700   // Longer sweep = smoother, more natural wail
 
 // ==================== THREAT LEVELS ====================
 enum ThreatLevel {
@@ -114,6 +119,44 @@ enum SystemState {
 // ==================== GLOBAL OBJECTS ====================
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
+WiFiServer apiServer(80);
+WiFiUDP udpDiscovery;
+bool udpStarted = false;
+const uint16_t UDP_DISCOVERY_PORT = 8888;
+
+struct LocalCommandEntry {
+  uint32_t id;
+  String type;
+  String payload;
+  String requestedBy;
+  String status;
+  unsigned long requestedAt;
+};
+
+static const int LOCAL_COMMAND_LOG_SIZE = 16;
+LocalCommandEntry localCommands[LOCAL_COMMAND_LOG_SIZE];
+int localCommandCount = 0;
+uint32_t localCommandNextId = 1;
+
+struct LocalEventEntry {
+  uint32_t id;
+  String type;        // "pir", "radar", "deterrent", "arm", "threat"
+  String title;
+  String details;
+  int threatLevel;
+  unsigned long timestamp;
+};
+
+static const int LOCAL_EVENT_LOG_SIZE = 32;
+LocalEventEntry localEvents[LOCAL_EVENT_LOG_SIZE];
+int localEventCount = 0;
+uint32_t localEventNextId = 1;
+bool mdnsStarted = false;
+bool apiServerStarted = false;
+WiFiClient wsClient;
+bool wsClientConnected = false;
+String wsHandshakeBuffer;
+String lastLocalStatusSignature;
 
 // Small MAX7219 driver using shiftOut so it works on ESP32 without AVR headers.
 // Provides a subset of the Adafruit_NeoPixel-like API used by the rest of this
@@ -235,6 +278,17 @@ unsigned long buttonAckStart = 0;
 // Matrix brightness control (auto-adjusted by LDR)
 int matrixBrightness = 60;
 
+// Battery monitoring
+float batteryVoltage = 0.0;
+int batteryPercent = 0;
+
+// Component toggles
+bool radarEnabled = true;
+bool pirEnabled = true;
+bool deterrentEnabled = true;
+bool matrixEnabled = true;
+bool buzzerEnabled = true;
+
 // ==========================================================
 // SETUP
 // ==========================================================
@@ -255,6 +309,7 @@ void setup() {
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_LED_RED, OUTPUT);
   pinMode(PIN_LED_WIFI, OUTPUT);
+  pinMode(PIN_BATTERY, INPUT);
 
   digitalWrite(PIN_BUZZER, LOW);
   digitalWrite(PIN_LED_RED, LOW);
@@ -277,6 +332,10 @@ void setup() {
   mqttClient.setSocketTimeout(2);
   mqttClient.setCallback(mqttCallback);
 
+  apiServer.begin();
+  apiServerStarted = true;
+  Serial.println("✓ Local API server started on port 80");
+
   Serial.println("✓ Hardware initialized");
   Serial.println("✓ Type 'help' for serial test commands\n");
 }
@@ -287,6 +346,7 @@ void setup() {
 void loop() {
   handleSerialTestMode();
   handleWiFiAndMQTT();
+  handleLocalApi();
 
   bool isDark = readIsDark();
   armed = armOverride ? armOverrideValue : isDark;
@@ -306,6 +366,584 @@ void loop() {
     publishStatus();
     lastStatusPublish = now;
   }
+
+  // Read battery voltage every 30 seconds
+  static unsigned long lastBatteryRead = 0;
+  if (now - lastBatteryRead > 30000) {
+    batteryVoltage = readBatteryVoltage();
+    batteryPercent = batteryPercentFromVoltage(batteryVoltage);
+    lastBatteryRead = now;
+  }
+}
+
+// ==========================================================
+// LOCAL API (HTTP + WebSocket)
+// ==========================================================
+String jsonEscape(const String& value) {
+  String out;
+  out.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); ++i) {
+    char c = value[i];
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"':  out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': break;
+      case '\t': out += "\\t"; break;
+      default: out += c; break;
+    }
+  }
+  return out;
+}
+
+String threatLevelLabel(ThreatLevel level) {
+  switch (level) {
+    case THREAT_CLEAR: return "clear";
+    case THREAT_CAUTION: return "caution";
+    case THREAT_DANGER: return "danger";
+    case THREAT_ALERT: return "alert";
+  }
+  return "clear";
+}
+
+String commandEntryJson(const LocalCommandEntry& entry) {
+  String json = "{";
+  json += "\"id\":" + String(entry.id) + ",";
+  json += "\"type\":\"" + jsonEscape(entry.type) + "\",";
+  json += "\"payload\":\"" + jsonEscape(entry.payload) + "\",";
+  json += "\"requestedBy\":\"" + jsonEscape(entry.requestedBy) + "\",";
+  json += "\"status\":\"" + jsonEscape(entry.status) + "\",";
+  json += "\"requestedAt\":" + String(entry.requestedAt);
+  json += "}";
+  return json;
+}
+
+String commandsJson() {
+  String json = "[";
+  for (int i = 0; i < localCommandCount; ++i) {
+    if (i) json += ",";
+    json += commandEntryJson(localCommands[i]);
+  }
+  json += "]";
+  return json;
+}
+
+String statusSignature() {
+  String sig;
+  sig.reserve(64);
+  sig += String(armed ? 1 : 0);
+  sig += '|';
+  sig += String(lastPirState);
+  sig += '|';
+  sig += String(lastRadarState);
+  sig += '|';
+  sig += String(readIsDark() ? 1 : 0);
+  sig += '|';
+  sig += String(currentThreatLevel);
+  sig += '|';
+  sig += String(deterrentActive ? 1 : 0);
+  sig += '|';
+  sig += String(localCommandCount);
+  sig += '|';
+  sig += String(WiFi.status() == WL_CONNECTED ? 1 : 0);
+  return sig;
+}
+
+String eventEntryJson(const LocalEventEntry& entry) {
+  String json = "{";
+  json += "\"id\":" + String(entry.id) + ",";
+  json += "\"type\":\"" + jsonEscape(entry.type) + "\",";
+  json += "\"title\":\"" + jsonEscape(entry.title) + "\",";
+  json += "\"details\":\"" + jsonEscape(entry.details) + "\",";
+  json += "\"threatLevel\":" + String(entry.threatLevel) + ",";
+  json += "\"timestamp\":" + String(entry.timestamp);
+  json += "}";
+  return json;
+}
+
+String eventsJson() {
+  String json = "[";
+  for (int i = localEventCount - 1; i >= 0; --i) {
+    if (i != localEventCount - 1) json += ",";
+    json += eventEntryJson(localEvents[i]);
+  }
+  json += "]";
+  return json;
+}
+
+void recordLocalEvent(const String& type, const String& title, const String& details, int threatLevel) {
+  LocalEventEntry entry;
+  entry.id = localEventNextId++;
+  entry.type = type;
+  entry.title = title;
+  entry.details = details;
+  entry.threatLevel = threatLevel;
+  entry.timestamp = millis();
+
+  if (localEventCount < LOCAL_EVENT_LOG_SIZE) {
+    localEvents[localEventCount++] = entry;
+  } else {
+    for (int i = 1; i < LOCAL_EVENT_LOG_SIZE; ++i) {
+      localEvents[i - 1] = localEvents[i];
+    }
+    localEvents[LOCAL_EVENT_LOG_SIZE - 1] = entry;
+  }
+}
+
+void clearLocalEvents() {
+  localEventCount = 0;
+}
+
+String statusJson() {
+  String ip = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "";
+  String json = "{";
+  json += "\"device\":{";
+  json += "\"pir\":" + String(lastPirState == HIGH ? "true" : "false") + ",";
+  json += "\"radar\":" + String(lastRadarState == HIGH ? "true" : "false") + ",";
+  json += "\"light\":" + String(readIsDark() ? "true" : "false") + ",";
+  json += "\"armed\":" + String(armed ? "true" : "false") + ",";
+  json += "\"online\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"deterrentActive\":" + String(deterrentActive ? "true" : "false") + ",";
+  json += "\"threatLevel\":" + String(currentThreatLevel) + ",";
+  json += "\"threatLabel\":\"" + threatLevelLabel(currentThreatLevel) + "\",";
+  json += "\"ip\":\"" + ip + "\",";
+  json += "\"updatedAt\":" + String(millis()) + ",";
+  json += "\"battery\":" + String(batteryPercent) + ",";
+  json += "\"components\":{";
+  json += "\"radar\":" + String(radarEnabled ? "true" : "false") + ",";
+  json += "\"pir\":" + String(pirEnabled ? "true" : "false") + ",";
+  json += "\"deterrent\":" + String(deterrentEnabled ? "true" : "false") + ",";
+  json += "\"matrix\":" + String(matrixEnabled ? "true" : "false") + ",";
+  json += "\"buzzer\":" + String(buzzerEnabled ? "true" : "false");
+  json += "},";
+  json += "\"commands\":" + commandsJson() + ",";
+  json += "\"events\":" + eventsJson();
+  json += "},";
+  json += "\"api\":{";
+  json += "\"local\":true,";
+  json += "\"websocket\":true,";
+  json += "\"port\":80";
+  json += "}";
+  json += "}";
+  return json;
+}
+
+void recordLocalCommand(const String& type, const String& payload, const String& requestedBy, const String& status) {
+  LocalCommandEntry entry;
+  entry.id = localCommandNextId++;
+  entry.type = type;
+  entry.payload = payload;
+  entry.requestedBy = requestedBy;
+  entry.status = status;
+  entry.requestedAt = millis();
+
+  if (localCommandCount < LOCAL_COMMAND_LOG_SIZE) {
+    localCommands[localCommandCount++] = entry;
+  } else {
+    for (int i = 1; i < LOCAL_COMMAND_LOG_SIZE; ++i) {
+      localCommands[i - 1] = localCommands[i];
+    }
+    localCommands[LOCAL_COMMAND_LOG_SIZE - 1] = entry;
+  }
+}
+
+bool removeLocalCommand(uint32_t id) {
+  for (int i = 0; i < localCommandCount; ++i) {
+    if (localCommands[i].id == id) {
+      for (int j = i + 1; j < localCommandCount; ++j) {
+        localCommands[j - 1] = localCommands[j];
+      }
+      localCommandCount--;
+      return true;
+    }
+  }
+  return false;
+}
+
+void clearLocalCommands() {
+  localCommandCount = 0;
+}
+
+void sendHttpResponse(WiFiClient& client, int code, const String& contentType, const String& body) {
+  const char* statusText = code == 200 ? "OK" : code == 201 ? "Created" : code == 202 ? "Accepted" : code == 204 ? "No Content" : code == 400 ? "Bad Request" : code == 404 ? "Not Found" : code == 500 ? "Internal Server Error" : "OK";
+  client.printf("HTTP/1.1 %d %s\r\n", code, statusText);
+  client.printf("Content-Type: %s\r\n", contentType.c_str());
+  client.print("Access-Control-Allow-Origin: *\r\n");
+  client.print("Access-Control-Allow-Headers: Content-Type\r\n");
+  client.print("Access-Control-Allow-Methods: GET,POST,DELETE,OPTIONS\r\n");
+  client.printf("Content-Length: %u\r\n", (unsigned)body.length());
+  client.print("Connection: close\r\n\r\n");
+  client.print(body);
+}
+
+void sendHttpJson(WiFiClient& client, int code, const String& body) {
+  sendHttpResponse(client, code, "application/json", body);
+}
+
+String getHeaderValue(const String& headerLine) {
+  int colon = headerLine.indexOf(':');
+  if (colon < 0) return "";
+  String value = headerLine.substring(colon + 1);
+  value.trim();
+  return value;
+}
+
+String stripQueryString(String path) {
+  int q = path.indexOf('?');
+  return q >= 0 ? path.substring(0, q) : path;
+}
+
+bool sendWsText(WiFiClient& client, const String& message) {
+  if (!client.connected()) return false;
+
+  size_t len = message.length();
+  uint8_t header[10];
+  size_t headerLen = 0;
+  header[0] = 0x81; // FIN + text frame
+  if (len < 126) {
+    header[1] = len;
+    headerLen = 2;
+  } else if (len < 65536) {
+    header[1] = 126;
+    header[2] = (len >> 8) & 0xFF;
+    header[3] = len & 0xFF;
+    headerLen = 4;
+  } else {
+    return false;
+  }
+
+  client.write(header, headerLen);
+  client.write((const uint8_t*)message.c_str(), len);
+  return true;
+}
+
+bool websocketAcceptKey(const String& clientKey, String& acceptKey) {
+  const String magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+  String source = clientKey + magic;
+
+  uint8_t sha1Result[20];
+  if (mbedtls_sha1_ret((const unsigned char*)source.c_str(), source.length(), sha1Result) != 0) {
+    return false;
+  }
+
+  unsigned char encoded[64];
+  size_t encodedLen = 0;
+  if (mbedtls_base64_encode(encoded, sizeof(encoded), &encodedLen, sha1Result, sizeof(sha1Result)) != 0) {
+    return false;
+  }
+
+  encoded[encodedLen] = 0;
+  acceptKey = String((char*)encoded);
+  return true;
+}
+
+void broadcastLocalStatus(bool force = false) {
+  String sig = statusSignature();
+  if (!force && sig == lastLocalStatusSignature) return;
+  lastLocalStatusSignature = sig;
+  if (wsClientConnected && wsClient.connected()) {
+    sendWsText(wsClient, statusJson());
+  }
+}
+
+void applyLocalArmMode(const String& mode) {
+  if (mode == "auto") {
+    armOverride = false;
+  } else if (mode == "on") {
+    armOverride = true;
+    armOverrideValue = true;
+  } else if (mode == "off") {
+    armOverride = true;
+    armOverrideValue = false;
+  }
+  recordLocalEvent("arm", "Arming Mode Changed", "System set to " + mode, 0);
+}
+
+void applyComponentToggle(const String& component) {
+  if (component == "radar") {
+    radarEnabled = !radarEnabled;
+    recordLocalEvent("component", "Radar Toggled", radarEnabled ? "Radar sensor enabled" : "Radar sensor disabled", 0);
+  } else if (component == "pir") {
+    pirEnabled = !pirEnabled;
+    recordLocalEvent("component", "PIR Toggled", pirEnabled ? "PIR sensor enabled" : "PIR sensor disabled", 0);
+  } else if (component == "deterrent") {
+    deterrentEnabled = !deterrentEnabled;
+    recordLocalEvent("component", "Deterrent Toggled", deterrentEnabled ? "Deterrent system enabled" : "Deterrent system disabled", 0);
+  } else if (component == "matrix") {
+    matrixEnabled = !matrixEnabled;
+    recordLocalEvent("component", "LED Matrix Toggled", matrixEnabled ? "LED matrix enabled" : "LED matrix disabled", 0);
+  } else if (component == "buzzer") {
+    buzzerEnabled = !buzzerEnabled;
+    recordLocalEvent("component", "Buzzer Toggled", buzzerEnabled ? "Buzzer enabled" : "Buzzer disabled", 0);
+  } else {
+    Serial.print("⚠️ Invalid component toggle request: "); Serial.println(component);
+    return;
+  }
+  broadcastLocalStatus(true);
+}
+
+void handleLocalCommand(const String& type, const String& payload, const String& requestedBy) {
+  recordLocalCommand(type, payload, requestedBy, "sent");
+  if (type == "deterrent") {
+    triggerDeterrent();
+  } else if (type == "arm") {
+    applyLocalArmMode(payload);
+  } else if (type == "toggle_component") {
+    applyComponentToggle(payload);
+  }
+  broadcastLocalStatus(true);
+}
+
+void handleWebSocketFrames() {
+  if (!wsClientConnected) return;
+  if (!wsClient.connected()) {
+    wsClient.stop();
+    wsClientConnected = false;
+    return;
+  }
+
+  while (wsClient.available() >= 2) {
+    uint8_t first = (uint8_t)wsClient.read();
+    uint8_t second = (uint8_t)wsClient.read();
+    bool masked = (second & 0x80) != 0;
+    uint64_t payloadLen = (second & 0x7F);
+
+    if (payloadLen == 126) {
+      if (wsClient.available() < 2) return;
+      payloadLen = ((uint64_t)(uint8_t)wsClient.read() << 8) | (uint64_t)(uint8_t)wsClient.read();
+    } else if (payloadLen == 127) {
+      // Not needed for the small payloads used by the mobile app.
+      wsClient.stop();
+      wsClientConnected = false;
+      return;
+    }
+
+    uint8_t mask[4] = {0, 0, 0, 0};
+    if (masked) {
+      if (wsClient.available() < 4) return;
+      wsClient.readBytes(mask, 4);
+    }
+
+    if (wsClient.available() < (int)payloadLen) return;
+
+    String payload;
+    payload.reserve(payloadLen);
+    for (uint64_t i = 0; i < payloadLen; ++i) {
+      char c = (char)wsClient.read();
+      if (masked) c ^= mask[i % 4];
+      payload += c;
+    }
+
+    uint8_t opcode = first & 0x0F;
+    if (opcode == 0x8) {
+      wsClient.stop();
+      wsClientConnected = false;
+      return;
+    }
+    if (opcode == 0x9) {
+      // Ping -> pong with same payload
+      String pong = payload;
+      if (wsClient.connected()) {
+        uint8_t pongHeader[2] = {0x8A, (uint8_t)pong.length()};
+        wsClient.write(pongHeader, 2);
+        wsClient.write((const uint8_t*)pong.c_str(), pong.length());
+      }
+      continue;
+    }
+    if (opcode != 0x1) continue;
+
+    String msg = payload;
+    msg.toLowerCase();
+if (msg.indexOf("\"type\":\"deterrent\"") >= 0 || msg.indexOf("trigger") >= 0) {
+      handleLocalCommand("deterrent", "trigger", "mobile");
+    } else if (msg.indexOf("\"type\":\"arm\"") >= 0) {
+      String mode = "auto";
+      if (msg.indexOf("\"mode\":\"on\"") >= 0) mode = "on";
+      else if (msg.indexOf("\"mode\":\"off\"") >= 0) mode = "off";
+      else if (msg.indexOf("\"mode\":\"auto\"") >= 0) mode = "auto";
+      handleLocalCommand("arm", mode, "mobile");
+    } else if (msg.indexOf("\"type\":\"toggle_component\"") >= 0) {
+      int start = msg.indexOf("\"component\":\"") + 13;
+      int end = msg.indexOf("\"", start);
+      String component = msg.substring(start, end);
+    if (component != "radar" && component != "pir" && component != "deterrent" && component != "matrix" && component != "buzzer") {
+        Serial.print("⚠️ Invalid component toggle via WebSocket: "); Serial.println(component);
+        continue;
+      }
+      handleLocalCommand("toggle_component", component, "mobile");
+    } else if (msg.indexOf("\"type\":\"clear_commands\"") >= 0) {
+      clearLocalCommands();
+      broadcastLocalStatus(true);
+    }
+  }
+}
+
+void handleHttpRequest(WiFiClient& client, const String& method, String path, const String& body) {
+  path = stripQueryString(path);
+
+  if (method == "OPTIONS") {
+    sendHttpResponse(client, 204, "text/plain", "");
+    return;
+  }
+
+  if (method == "GET" && path == "/api/status") {
+    sendHttpJson(client, 200, statusJson());
+    return;
+  }
+
+  if (method == "GET" && path == "/api/events") {
+    sendHttpJson(client, 200, String("{\"events\":") + eventsJson() + "}");
+    return;
+  }
+
+  if (method == "DELETE" && path == "/api/events") {
+    clearLocalEvents();
+    broadcastLocalStatus(true);
+    sendHttpJson(client, 200, "{\"deleted\":true}");
+    return;
+  }
+
+  if (method == "GET" && path == "/api/commands") {
+    sendHttpJson(client, 200, String("{\"commands\":") + commandsJson() + "}");
+    return;
+  }
+
+  if (method == "DELETE" && path == "/api/commands") {
+    clearLocalCommands();
+    broadcastLocalStatus(true);
+    sendHttpJson(client, 200, "{\"deleted\":true}");
+    return;
+  }
+
+  if (method == "DELETE" && path.startsWith("/api/commands/")) {
+    uint32_t id = path.substring(String("/api/commands/").length()).toInt();
+    bool deleted = removeLocalCommand(id);
+    if (deleted) {
+      broadcastLocalStatus(true);
+      sendHttpJson(client, 200, "{\"deleted\":true}");
+    } else {
+      sendHttpJson(client, 404, "{\"error\":\"Command not found.\"}");
+    }
+    return;
+  }
+
+  if (method == "POST" && path == "/api/commands/deterrent") {
+    handleLocalCommand("deterrent", body.length() ? body : "trigger", "mobile");
+    sendHttpJson(client, 202, "{\"accepted\":true}");
+    return;
+  }
+
+  if (method == "POST" && path == "/api/commands/arm") {
+    String mode = "auto";
+    String bodyLower = body;
+    bodyLower.toLowerCase();
+    if (bodyLower.indexOf("\"mode\":\"on\"") >= 0 || bodyLower.indexOf("mode=on") >= 0) mode = "on";
+    else if (bodyLower.indexOf("\"mode\":\"off\"") >= 0 || bodyLower.indexOf("mode=off") >= 0) mode = "off";
+    else if (bodyLower.indexOf("\"mode\":\"auto\"") >= 0 || bodyLower.indexOf("mode=auto") >= 0) mode = "auto";
+    handleLocalCommand("arm", mode, "mobile");
+    sendHttpJson(client, 202, "{\"accepted\":true}");
+    return;
+  }
+
+  if (method == "POST" && path == "/api/commands/toggle_component") {
+    String component = "";
+    String bodyLower = body;
+    bodyLower.toLowerCase();
+    if (bodyLower.indexOf("\"component\":\"pir\"") >= 0 || bodyLower.indexOf("component=pir") >= 0) component = "pir";
+    else if (bodyLower.indexOf("\"component\":\"deterrent\"") >= 0 || bodyLower.indexOf("component=deterrent") >= 0) component = "deterrent";
+    else if (bodyLower.indexOf("\"component\":\"matrix\"") >= 0 || bodyLower.indexOf("component=matrix") >= 0) component = "matrix";
+    else if (bodyLower.indexOf("\"component\":\"radar\"") >= 0 || bodyLower.indexOf("component=radar") >= 0) component = "radar";
+    else if (bodyLower.indexOf("\"component\":\"buzzer\"") >= 0 || bodyLower.indexOf("component=buzzer") >= 0) component = "buzzer";
+      if (component != "radar" && component != "pir" && component != "deterrent" && component != "matrix" && component != "buzzer") {
+      sendHttpJson(client, 400, "{\"error\":\"Invalid component. Must be one of: radar, pir, deterrent, matrix, buzzer\"}");
+      return;
+    }
+    handleLocalCommand("toggle_component", component, "mobile");
+    sendHttpJson(client, 202, "{\"accepted\":true}");
+    return;
+  }
+
+  sendHttpJson(client, 404, "{\"error\":\"Not found\"}");
+}
+
+void handleLocalApi() {
+  if (!apiServerStarted) return;
+
+  if (wsClientConnected && !wsClient.connected()) {
+    wsClient.stop();
+    wsClientConnected = false;
+  }
+
+  handleWebSocketFrames();
+  broadcastLocalStatus(false);
+
+  WiFiClient client = apiServer.available();
+  if (!client) return;
+
+  client.setTimeout(1000);
+  String requestLine = client.readStringUntil('\n');
+  requestLine.trim();
+  if (!requestLine.length()) {
+    client.stop();
+    return;
+  }
+
+  int firstSpace = requestLine.indexOf(' ');
+  int secondSpace = requestLine.indexOf(' ', firstSpace + 1);
+  if (firstSpace < 0 || secondSpace < 0) {
+    client.stop();
+    return;
+  }
+
+  String method = requestLine.substring(0, firstSpace);
+  String path = requestLine.substring(firstSpace + 1, secondSpace);
+  int contentLength = 0;
+  String wsKey;
+  bool wantsWebSocket = false;
+
+  while (client.connected()) {
+    String header = client.readStringUntil('\n');
+    header.trim();
+    if (!header.length()) break;
+    String lower = header;
+    lower.toLowerCase();
+    if (lower.startsWith("content-length:")) {
+      contentLength = getHeaderValue(header).toInt();
+    } else if (lower.startsWith("sec-websocket-key:")) {
+      wsKey = getHeaderValue(header);
+    } else if (lower.startsWith("upgrade:")) {
+      wantsWebSocket = lower.indexOf("websocket") >= 0;
+    }
+  }
+
+  String body;
+  while ((int)body.length() < contentLength && client.connected()) {
+    if (!client.available()) { delay(1); continue; }
+    body += (char)client.read();
+  }
+
+  if (path == "/ws" && wantsWebSocket && wsKey.length()) {
+    String acceptKey;
+    if (websocketAcceptKey(wsKey, acceptKey)) {
+      client.printf("HTTP/1.1 101 Switching Protocols\r\n");
+      client.print("Upgrade: websocket\r\n");
+      client.print("Connection: Upgrade\r\n");
+      client.print("Sec-WebSocket-Accept: ");
+      client.print(acceptKey);
+      client.print("\r\n\r\n");
+
+      if (wsClientConnected) {
+        wsClient.stop();
+      }
+      wsClient = client;
+      wsClientConnected = true;
+      broadcastLocalStatus(true);
+      return;
+    }
+  }
+
+  handleHttpRequest(client, method, path, body);
+  client.stop();
 }
 
 // ==========================================================
@@ -315,6 +953,20 @@ bool readIsDark() {
   int raw = digitalRead(PIN_LDR);
   bool rawHigh = (raw == HIGH);
   return LDR_DARK_WHEN_HIGH ? rawHigh : !rawHigh;
+}
+
+float readBatteryVoltage() {
+  int raw = analogRead(PIN_BATTERY);
+  float voltage = (raw / 4095.0) * 3.3 * 2.0;
+  return voltage;
+}
+
+int batteryPercentFromVoltage(float voltage) {
+  if (voltage >= 4.20) return 100;
+  if (voltage <= 3.30) return 0;
+  if (voltage >= 3.90) return (int)((voltage - 3.90) / (4.20 - 3.90) * 50 + 50);
+  if (voltage >= 3.60) return (int)((voltage - 3.60) / (3.90 - 3.60) * 30 + 20);
+  return (int)((voltage - 3.30) / (3.60 - 3.30) * 20);
 }
 
 void updateMatrixBrightness() {
@@ -373,6 +1025,7 @@ void handleRadarSensor() {
     if (!radarCautionTriggered && radarDuration > RADAR_CAUTION_MS) {
       radarCautionTriggered = true;
       currentThreatLevel = THREAT_CAUTION;
+      recordLocalEvent("radar", "Radar Motion Detected", "RCWL-0516 microwave radar detected movement nearby", 1);
       Serial.println("📡 RADAR: Sustained motion - CAUTION level");
       if (mqttClient.connected()) {
         char buf[4]; snprintf(buf, sizeof(buf), "%d", currentThreatLevel);
@@ -404,9 +1057,11 @@ void handlePIRSensor() {
       // PIR fired! Check if radar is also active for threat level
       if (lastRadarState == HIGH) {
         currentThreatLevel = THREAT_DANGER;
+        recordLocalEvent("pir", "Dual Motion Threat", "PIR + Radar simultaneous motion detected", 2);
         Serial.println("🚶 PIR: Motion + RADAR active - DANGER level");
       } else {
         currentThreatLevel = THREAT_CAUTION;
+        recordLocalEvent("pir", "PIR Motion Detected", "Passive infrared motion sensor triggered", 1);
         Serial.println("🚶 PIR: Motion detected");
       }
       
@@ -485,30 +1140,50 @@ void triggerDeterrent() {
   currentThreatLevel = THREAT_ALERT;
   currentState = STATE_ALERT;
   digitalWrite(PIN_LED_RED, HIGH);
+  recordLocalEvent("deterrent", "Deterrent Activated", "Strobe lights & high-decibel siren engaged", 3);
   Serial.println("🚨 DETERRENT TRIGGERED!");
 }
 
-void updateSiren() {
-  unsigned long elapsed = millis() - deterrentStartTime;
-  unsigned long sweepPhase = elapsed % SIREN_SWEEP_MS;
-  float t = (float)sweepPhase / SIREN_SWEEP_MS;
-  float ramp = (t < 0.5) ? (t * 2) : (2 - t * 2);
-  int baseFreq = SIREN_MIN_HZ + (int)(ramp * (SIREN_MAX_HZ - SIREN_MIN_HZ));
+// Cached siren state — only call tone()/noTone() when values actually change
+// to prevent LEDC timer resets that create click/glitch artifacts.
+static int   lastSirenFreq = 0;
+static bool  lastSirenOn   = false;
 
-  // Warble between baseFreq and a slightly higher frequency to make the siren more urgent
-  int warbleFreq = baseFreq + ((elapsed / 300) % 2 == 0 ? 0 : 300);
-  // Create short gaps for a pulsing effect (makes the sound more attention-grabbing)
-  unsigned long pulseCycle = elapsed % 1000;
-  if (pulseCycle < 800) {
-    tone(PIN_BUZZER, min(warbleFreq, SIREN_MAX_HZ));
+void updateSiren() {
+  unsigned long elapsed   = millis() - deterrentStartTime;
+  // Two-cycle wail: 600ms rising + 600ms falling per 1200ms period
+  unsigned long period    = 1200UL;
+  unsigned long phase     = elapsed % period;
+  float t = (float)phase / period;           // 0.0 → 1.0
+  // Smooth triangle: up for first half, down for second half
+  float ramp = (t < 0.5f) ? (t * 2.0f) : (2.0f - t * 2.0f);
+  // Ease in/out with a sine-like curve for a cleaner sound transition
+  ramp = ramp * ramp * (3.0f - 2.0f * ramp); // smoothstep
+  int targetFreq = SIREN_MIN_HZ + (int)(ramp * (SIREN_MAX_HZ - SIREN_MIN_HZ));
+
+  // 100ms silence gap at the very end of each 1200ms cycle (brief breath)
+  bool shouldBeOn = (phase < (period - 100UL));
+
+  // Only call tone()/noTone() when state actually changes — prevents PWM-timer
+  // resets that cause audible clicks on every main-loop iteration.
+  if (shouldBeOn) {
+    if (!lastSirenOn || abs(targetFreq - lastSirenFreq) > 10) {
+      tone(PIN_BUZZER, targetFreq);
+      lastSirenFreq = targetFreq;
+      lastSirenOn   = true;
+    }
   } else {
-    noTone(PIN_BUZZER);
+    if (lastSirenOn) {
+      noTone(PIN_BUZZER);
+      lastSirenOn = false;
+    }
   }
 }
 
 void updateDeterrent() {
   if (!deterrentActive) return;
-  
+  if (!buzzerEnabled) { noTone(PIN_BUZZER); lastSirenOn = false; return; }
+
   unsigned long elapsed = millis() - deterrentStartTime;
   updateSiren();
   
@@ -516,6 +1191,8 @@ void updateDeterrent() {
     deterrentActive = false;
     digitalWrite(PIN_LED_RED, LOW);
     noTone(PIN_BUZZER);
+    lastSirenOn   = false;
+    lastSirenFreq = 0;
     Serial.println("✓ Deterrent cycle complete");
   }
 }
@@ -715,12 +1392,51 @@ void handleWiFiAndMQTT() {
   if (WiFi.status() != WL_CONNECTED) {
     digitalWrite(PIN_LED_WIFI, (millis() / 300) % 2);
     startWiFiConnection();
-  } else if (!mqttClient.connected()) {
-    digitalWrite(PIN_LED_WIFI, (millis() / 150) % 2);
-    connectMQTT();
   } else {
-    digitalWrite(PIN_LED_WIFI, HIGH);
-    mqttClient.loop();
+    if (!mdnsStarted) {
+      if (MDNS.begin("coop-plus")) {
+        MDNS.addService("http", "tcp", 80);
+        mdnsStarted = true;
+        Serial.println("✓ mDNS Responder started: http://coop-plus.local");
+      }
+    }
+    if (!udpStarted) {
+      if (udpDiscovery.begin(UDP_DISCOVERY_PORT)) {
+        udpStarted = true;
+        Serial.println("✓ UDP Discovery Responder listening on port 8888");
+      }
+    }
+    handleUdpDiscovery();
+    if (!mqttClient.connected()) {
+      digitalWrite(PIN_LED_WIFI, (millis() / 150) % 2);
+      connectMQTT();
+    } else {
+      digitalWrite(PIN_LED_WIFI, HIGH);
+      mqttClient.loop();
+    }
+  }
+}
+
+void handleUdpDiscovery() {
+  if (!udpStarted) return;
+  int packetSize = udpDiscovery.parsePacket();
+  if (packetSize) {
+    char packetBuffer[128];
+    int len = udpDiscovery.read(packetBuffer, sizeof(packetBuffer) - 1);
+    if (len > 0) packetBuffer[len] = 0;
+    
+    String req = String(packetBuffer);
+    req.toLowerCase();
+    
+    if (req.indexOf("coop") >= 0 || req.indexOf("discover") >= 0 || req.length() > 0) {
+      String ip = WiFi.localIP().toString();
+      String response = "{\"name\":\"Coop+\",\"ip\":\"" + ip + "\",\"port\":80,\"type\":\"smart-coop\"}";
+      
+      udpDiscovery.beginPacket(udpDiscovery.remoteIP(), udpDiscovery.remotePort());
+      udpDiscovery.print(response);
+      udpDiscovery.endPacket();
+      Serial.print("📡 Responded to UDP discovery from "); Serial.println(udpDiscovery.remoteIP().toString());
+    }
   }
 }
 
@@ -848,7 +1564,8 @@ void testBuzzer() {
   deterrentActive = true;
 
   while (millis() - start < 2000) {
-    updateSiren();
+    if (buzzerEnabled) updateSiren();
+    else noTone(PIN_BUZZER);
     delay(25);
   }
 
@@ -889,6 +1606,12 @@ void printSystemStatus() {
 
   Serial.print("║ MQTT:           ");
   Serial.println(mqttClient.connected() ? "✓ Connected  ║" : "✗ Disconnected ║");
+
+  Serial.print("║ Local API:      ");
+  Serial.println(apiServerStarted ? "✓ Ready      ║" : "✗ Offline    ║");
+
+  Serial.print("║ WebSocket:      ");
+  Serial.println(wsClientConnected ? "✓ Client     ║" : "✗ None       ║");
 
   Serial.print("║ Armed:          ");
   Serial.println(armed ? "✓ YES        ║" : "✗ NO         ║");

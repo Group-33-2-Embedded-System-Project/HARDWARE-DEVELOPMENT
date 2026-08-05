@@ -1,0 +1,51 @@
+export const BRAND = '#CFD91A';
+export const BRAND_DARK = '#A8B015';
+
+export function getTheme(mode, sys) {
+  const dark = mode === 'dark' || (mode === 'system' && sys !== 'light');
+  return dark ? {
+    dark: true,
+    bg:        '#0A0A0A',
+    surface:   '#161616',
+    surface2:  '#1E1E1E',
+    surface3:  '#272727',
+    text:      '#FFFFFF',
+    textSub:   '#ADADAD',
+    textMuted: '#888',
+    accent:    BRAND,
+    accentDim: BRAND + '22',
+    accentTxt: BRAND,
+    danger:    '#FF4444',
+    dangerDim: '#FF444422',
+    warn:      '#FFAA00',
+    warnDim:   '#FFAA0022',
+    ok:        '#30D158',
+    okDim:     '#30D15822',
+    border:    '#2A2A2A',
+    inputBg:   '#1A1A1A',
+    tab:       '#161616',
+    shadow:    '#000',
+  } : {
+    dark: false,
+    bg:        '#F2F2F7',
+    surface:   '#FFFFFF',
+    surface2:  '#E5E5EA',
+    surface3:  '#D1D1D6',
+    text:      '#1A1A1A',
+    textSub:   '#555',
+    textMuted: '#ADADAD',
+    accent:    BRAND_DARK,
+    accentDim: BRAND + '18',
+    accentTxt: '#6B7200',
+    danger:    '#FF3B30',
+    dangerDim: '#FF3B3018',
+    warn:      '#FF9500',
+    warnDim:   '#FF950018',
+    ok:        '#34C759',
+    okDim:     '#34C75918',
+    border:    '#D1D1D6',
+    inputBg:   '#E5E5EA',
+    tab:       '#FFFFFF',
+    shadow:    'rgba(0,0,0,0.06)',
+  };
+}

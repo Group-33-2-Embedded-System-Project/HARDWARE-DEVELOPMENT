@@ -1,0 +1,35 @@
+{
+  "expo": {
+    "name": "Coop+",
+    "slug": "coop-plus",
+    "scheme": "coopplus",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "backgroundColor": "#CFD91A",
+      "resizeMode": "contain"
+    },
+    "ios": {
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        }
+      }
+    },
+    "android": {
+      "package": "com.coopplus.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#CFD91A"
+      }
+    },
+    "plugins": [
+      "expo-font"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "d080d752-a699-4809-a386-1a2c3a0846ec"
+      }
+    }
+  }
+}
