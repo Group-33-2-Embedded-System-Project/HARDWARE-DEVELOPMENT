@@ -19,6 +19,15 @@ version has no door-lock servo.
 All four files must sit in the **same project folder** (whether that's a Wokwi project
 or a local Arduino sketch folder).
 
+### Revised 3D enclosure
+
+The original root-level STL exports are legacy files and are substantially oversized.
+The editable compact replacement is in [`enclosure/`](enclosure/):
+`smart_coop_enclosure.scad` generates a 104 × 78 × 30 mm base and a matching fitted
+lid. The design uses 1.8 mm walls, a 1.6 mm floor/lid, M2.5 screw bosses, a
+MAX7219 display aperture, a cable exit, and print-friendly ventilation. Component
+envelopes, tolerances, and export instructions are in `enclosure/DIMENSIONS.md`.
+
 ---
 
 ## 2. Hardware / Bill of Materials
