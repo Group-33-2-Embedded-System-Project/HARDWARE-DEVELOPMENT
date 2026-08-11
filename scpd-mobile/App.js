@@ -23,6 +23,7 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
+import * as Network from 'expo-network';
 
 /* ─── ERROR BOUNDARY ──────────────────────────────── */
 class ErrorBoundary extends React.Component {
@@ -120,12 +121,14 @@ function TacticalRadar({ theme, active, radarActive, pirActive }) {
   // Fade target blip in and out when active
   useEffect(() => {
     if (radarActive || pirActive) {
-      Animated.loop(
+      const anim = Animated.loop(
         Animated.sequence([
           Animated.timing(blipOpacity, { toValue: 1, duration: 200, useNativeDriver: true }),
           Animated.timing(blipOpacity, { toValue: 0.2, duration: 800, useNativeDriver: true }),
         ])
-      ).start();
+      );
+      anim.start();
+      return () => anim.stop();   // stop the previous loop so loops don't stack
     } else {
       blipOpacity.setValue(0);
     }
@@ -138,6 +141,23 @@ function TacticalRadar({ theme, active, radarActive, pirActive }) {
 
   const radarColor = theme.dark ? BRAND : '#7A8200';
   const blipColor = pirActive ? theme.danger : theme.warn;
+
+  // Pick a fresh random position inside the radar ring each time a detection
+  // starts, so repeated detections don't stack on the same pixel.
+  const randPos = () => ({
+    top: 15 + Math.random() * 55,   // keep blip within the main radar area
+    left: 20 + Math.random() * 60,
+  });
+  const [radarPos, setRadarPos] = useState(() => randPos());
+  const [pirPos, setPirPos] = useState(() => randPos());
+  const prevRadar = useRef(false);
+  const prevPir = useRef(false);
+  useEffect(() => {
+    if (radarActive && !prevRadar.current) setRadarPos(randPos());
+    if (pirActive && !prevPir.current) setPirPos(randPos());
+    prevRadar.current = radarActive;
+    prevPir.current = pirActive;
+  }, [radarActive, pirActive]);
 
   return (
     <View style={[styles.radarContainer, { backgroundColor: theme.dark ? '#050D02' : '#F4F9F2', borderColor: radarColor + '20' }]}>
@@ -180,8 +200,8 @@ function TacticalRadar({ theme, active, radarActive, pirActive }) {
             styles.radarBlip,
             {
               backgroundColor: blipColor,
-              top: '25%',
-              left: '65%',
+              top: radarPos.top + '%',
+              left: radarPos.left + '%',
               opacity: blipOpacity,
             },
           ]}
@@ -197,8 +217,8 @@ function TacticalRadar({ theme, active, radarActive, pirActive }) {
             styles.radarBlip,
             {
               backgroundColor: theme.danger,
-              top: '60%',
-              left: '35%',
+              top: pirPos.top + '%',
+              left: pirPos.left + '%',
               opacity: blipOpacity,
             },
           ]}
@@ -519,8 +539,7 @@ export default function App() {
     sock.onerror  = () => showToast('WebSocket error', 'error');
     sock.onclose  = () => {
       if (canReco.current) {
-        setConnecting(true);
-        recoTimer.current = setTimeout(connectWithHost.bind(null, host, port), 4000);
+        recoTimer.current = setTimeout(reconnectSilent.bind(null, host, port), 4000);
       } else {
         setConnected(false);
         setConnecting(false);
@@ -528,7 +547,23 @@ export default function App() {
     };
   }
 
+  async function reconnectSilent(host, port) {
+    canReco.current = false;
+    ws.current?.close();
+    ws.current = null;
+    canReco.current = true;
+    try {
+      await loadStatus(host, port);
+      setConnected(true);
+      attachWs(host, port);
+      setOnboarded(true);
+    } catch (e) {
+      setConnected(false);
+    }
+  }
+
   async function connectWithHost(host, port) {
+    clearTimeout(recoTimer.current);
     setConnecting(true);
     canReco.current = false;
     ws.current?.close();
@@ -557,58 +592,69 @@ export default function App() {
     await connectWithHost(host, port);
   }
 
+  async function getPhoneSubnet() {
+    try {
+      const ip = await Network.getIpAddressAsync();
+      const p = (ip || '').split('.');
+      // Only private IPv4 ranges make sense for a local coop device
+      if (p.length === 4 && (p[0] === '192' || p[0] === '10' || p[0] === '172')) {
+        return `${p[0]}.${p[1]}.${p[2]}`;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  async function tryHost(host) {
+    try {
+      const ctrl = new AbortController();
+      const tid  = setTimeout(() => ctrl.abort(), 700);
+      const res  = await fetch(apiUrl(host, '80', '/api/status'), { signal: ctrl.signal });
+      clearTimeout(tid);
+      if (res.ok) {
+        const data = await safeJson(res);
+        if (data?.device) return host;
+      }
+    } catch (e) {}
+    return null;
+  }
+
   async function autoDetect() {
     if (connected)  { showToast('Already connected to Coop+', 'ok'); return; }
     if (detecting)  { return; }  // prevent stacking
     setDetecting(true);
     showToast('Scanning local network…');
 
+    // 1) Known hostnames + a few common static IPs
     const priority = ['coop-plus.local','smart-coop.local','192.168.1.50','192.168.0.50','192.168.1.100','192.168.0.100','192.168.4.1'];
     for (const host of priority) {
-      try {
-        const ctrl = new AbortController();
-        const tid  = setTimeout(() => ctrl.abort(), 800);
-        const res  = await fetch(apiUrl(host, '80', '/api/status'), { signal: ctrl.signal });
-        clearTimeout(tid);
-        if (res.ok) {
-          const data = await safeJson(res);
-          if (data?.device) {
-            setEndpoint({ host, port: '80' });
-            setStatus(data);
-            setDetecting(false);
-            await connectWithHost(host, '80');
-            return true;
-          }
-        }
-      } catch {}
+      const found = await tryHost(host);
+      if (found) {
+        setEndpoint({ host: found, port: '80' });
+        setDetecting(false);
+        await connectWithHost(found, '80');
+        return true;
+      }
     }
 
-    /* Parallel subnet sweep */
-    for (const sub of ['192.168.1','192.168.0','192.168.26']) {
-      for (let i = 2; i <= 254; i += 25) {
+    // 2) Sweep the phone's ACTUAL subnet first (most reliable), then common
+    //    fallbacks. Scanning the real /24 host-by-host guarantees we find the
+    //    coop even if the router uses an unusual range (e.g. 192.168.8.x).
+    const phoneSubnet = await getPhoneSubnet();
+    const subnets = ['192.168.1','192.168.0','192.168.26'];
+    if (phoneSubnet && !subnets.includes(phoneSubnet)) subnets.unshift(phoneSubnet);
+
+    for (const sub of subnets) {
+      const full = (sub === phoneSubnet); // scan every host on the real subnet
+      const batchSize = full ? 20 : 25;
+      for (let i = 2; i <= 254; i += batchSize) {
         const batch = [];
-        for (let j = i; j < i + 25 && j <= 254; j++) {
-          const ip = `${sub}.${j}`;
-          batch.push((async () => {
-            try {
-              const ctrl = new AbortController();
-              const tid  = setTimeout(() => ctrl.abort(), 600);
-              const res  = await fetch(apiUrl(ip, '80', '/api/status'), { signal: ctrl.signal });
-              clearTimeout(tid);
-              if (res.ok) {
-                const d = await safeJson(res);
-                if (d?.device) return { ip, d };
-              }
-            } catch {}
-            return null;
-          })());
-        }
+        const end = Math.min(i + batchSize - 1, 254);
+        for (let j = i; j <= end; j++) batch.push(tryHost(`${sub}.${j}`));
         const found = (await Promise.all(batch)).find(Boolean);
         if (found) {
-          setEndpoint({ host: found.ip, port: '80' });
-          setStatus(found.d);
+          setEndpoint({ host: found, port: '80' });
           setDetecting(false);
-          await connectWithHost(found.ip, '80');
+          await connectWithHost(found, '80');
           return true;
         }
       }
@@ -650,7 +696,17 @@ export default function App() {
     try {
       const res = await fetch(apiUrl(endpoint.host, endpoint.port, '/api/events'), { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed');
-      setEvents([]); showToast('Events cleared', 'ok');
+      await loadStatus();                 // refetch authoritative state (works without WS)
+      showToast('Events cleared', 'ok');
+    } catch (e) { showToast(e.message, 'error'); }
+  }
+
+  async function deleteEvent(id) {
+    try {
+      const res = await fetch(apiUrl(endpoint.host, endpoint.port, `/api/events/${id}`), { method: 'DELETE' });
+      if (!res.ok) throw new Error('Failed');
+      await loadStatus();
+      showToast('Event deleted', 'ok');
     } catch (e) { showToast(e.message, 'error'); }
   }
 
@@ -932,7 +988,7 @@ export default function App() {
         {isEvents && (
           evList.length > 0 ? (
             <View style={{ gap: 8 }}>
-              {visEv.map(ev => <EventRow key={ev.id} theme={theme} ev={ev} />)}
+              {visEv.map(ev => <EventRow key={ev.id} theme={theme} ev={ev} onDelete={() => deleteEvent(ev.id)} />)}
               {hasMore && (
                 <TouchableOpacity onPress={() => setShowAll(p => !p)} style={[s.moreBtn, { backgroundColor: theme.surface2 }]} activeOpacity={0.8}>
                   <Text style={{ fontSize: 14, fontWeight: '600', color: theme.textSub }}>
@@ -1241,7 +1297,7 @@ return (
 
 /* ─── SMALL COMPONENTS ────────────────────────────────────── */
 
-function EventRow({ theme, ev, compact = false }) {
+function EventRow({ theme, ev, compact = false, onDelete }) {
   const meta = useMemo(() => {
     if (ev.type === 'deterrent') return { icon: 'flash',           color: theme.danger };
     if (ev.type === 'pir')       return { icon: 'eye',             color: theme.warn  };
@@ -1266,6 +1322,11 @@ function EventRow({ theme, ev, compact = false }) {
           <Text style={{ fontSize: 12, color: theme.textSub, lineHeight: 17 }} numberOfLines={2}>{ev.details}</Text>
         )}
       </View>
+      {onDelete && (
+        <TouchableOpacity onPress={onDelete} hitSlop={12} activeOpacity={0.6} style={{ padding: 6 }}>
+          <Ionicons name="trash-outline" size={16} color={theme.danger} />
+        </TouchableOpacity>
+      )}
     </View>
   );
 }

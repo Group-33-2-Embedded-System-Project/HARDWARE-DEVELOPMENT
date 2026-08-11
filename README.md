@@ -1,9 +1,8 @@
 # Smart Coop Predator Deterrent — ESP32 Edition
 
-A WiFi-connected predator deterrent system for chicken coops. It watches for motion
-after dark, fires lights + sound + a strobing "eyes" pattern to scare off predators,
-and reports/accepts commands from a companion app over MQTT. The current hardware
-version has no door-lock servo.
+A self-contained, WiFi-connected predator deterrent for chicken coops. The ESP32 runs a local HTTP + WebSocket API — **no backend, no MQTT broker, no cloud**. A companion mobile app connects directly to the device over your home WiFi.
+
+The system arms automatically at night, watches for motion with radar + PIR, escalates through CLEAR → CAUTION → DANGER → ALERT, and fires a two-tone siren + red strobe + 8×8 matrix display. Everything is visible on the device itself; the app is for remote monitoring and control.
 
 ---
 
@@ -12,8 +11,9 @@ version has no door-lock servo.
 | File | Purpose |
 |---|---|
 | `diagram.json` | Wokwi circuit diagram (ESP32 + all sensors/actuators wired) |
-| `sketch.ino` (`smart_coop_deterrent.ino`) | Main firmware |
-| `libraries.txt` | Tells Wokwi which libraries to auto-install |
+| `smart_coop_deterrent.ino` | Main firmware |
+| `libraries.txt` | Wokwi library auto-install list |
+| `scpd-mobile/App.js` | React Native / Expo companion app |
 | `README.md` | This file |
 
 All four files must sit in the **same project folder** (whether that's a Wokwi project
@@ -31,202 +31,152 @@ envelopes, tolerances, and export instructions are in `enclosure/DIMENSIONS.md`.
 ---
 
 ## 2. Hardware / Bill of Materials
+---
 
-- ESP32 DevKit V1 (the "brain" — replaces any Arduino Uno; Uno has no WiFi so it's not used in this project)
-- PIR motion sensor
-- LDR module with a digital `DO` output (LM393-style comparator module)
-- 8x8 WS2812 NeoPixel matrix
-- Piezo buzzer
-- 2x LED (1 red = deterrent indicator, 1 green = WiFi status) + 2x 220Ω resistors
-- Pushbutton (manual trigger/test)
+## 2. Hardware / Bill of Materials
+
+- ESP32 DevKit V1
+- RCWL-0516 microwave radar sensor
+- HC-SR501 (or similar) PIR motion sensor
+- LDR module with digital `DO` output (LM393-style)
+- 8×8 LED matrix — **MAX7219 / 1088AS** (DIN → GPIO 5, CS → GPIO 17, CLK → GPIO 18)
+- Passive buzzer → GPIO 26
+- Red alert LED (through 220 Ω) → GPIO 25
+- WiFi status LED → GPIO 2
+- Pushbutton (manual trigger) → GPIO 32
+- 5 V regulated supply for the matrix (≥ 4 A recommended); common GND with ESP32
+
+> **Note:** The matrix is driven with a small built-in MAX7219 `shiftOut` driver — no extra NeoPixel/Adafruit_NeoPixel library needed. A 74AHCT125 level shifter on the matrix data line is recommended for reliable real-world operation.
+
+---
 
 ## 3. Pinout (ESP32 DevKit V1)
 
 | Component | Pin | Notes |
 |---|---|---|
+| RCWL-0516 OUT | GPIO 4 | 3.3 V-tolerant radar output |
 | PIR OUT | GPIO 27 | digital input |
-| Pushbutton | GPIO 26 | `INPUT_PULLUP`, other leg to GND |
-| LDR DO | GPIO 34 | digital input; use the module trimmer to set the night threshold |
-| NeoPixel Matrix DIN | GPIO 5 | WS2812, driven via Adafruit_NeoPixel |
-| Deterrent LED (red) | GPIO 25 | through 220Ω resistor |
-| WiFi status LED (green) | GPIO 2 | through 220Ω resistor |
-| Buzzer | GPIO 33 | driven with `tone()`/`noTone()` |
-
-Power in Wokwi is shown from the ESP32 pins. **For the physical build, do not power
-the 8x8 matrix from the ESP32's 5V/USB pin.** Use a regulated 5V supply rated for at
-least 4A, connect that supply directly to matrix `VDD` and `GND`, and connect its GND
-to ESP32 GND (a common ground is required). Keep the 330Ω data resistor; add a
-1000µF electrolytic capacitor across matrix 5V/GND near the matrix. A 74AHCT125 or
-74HCT125 3.3V-to-5V level shifter on the matrix data wire is strongly recommended
-for reliable real-world WS2812 operation.
-
-The diagram uses the common HC-SR501 arrangement: PIR powered from 5V, with its 3.3V
-`OUT` signal connected directly to GPIO27. Before wiring a different physical PIR,
-check its datasheet. If its `OUT` signal is genuinely 5V, use a proper 3.3V logic-level
-shifter; ESP32 GPIO pins are not 5V tolerant. Multiple `GND` pins (`GND.1`, `GND.2`,
-`GND.3`) are all common ground points.
+| Pushbutton | GPIO 32 | `INPUT_PULLUP`, other leg to GND |
+| LDR DO | GPIO 34 | digital input; adjust the module trimmer for your dark threshold |
+| Matrix DIN | GPIO 5 | MAX7219 data |
+| Matrix CS | GPIO 17 | MAX7219 chip-select |
+| Matrix CLK | GPIO 18 | MAX7219 clock |
+| Buzzer | GPIO 26 | passive buzzer + GND |
+| Red alert LED | GPIO 25 | through 220 Ω |
+| WiFi status LED | GPIO 2 | through 220 Ω |
+| Battery voltage sense | GPIO 35 | optional analog input |
 
 ---
 
-## 4. Running the Simulation in Wokwi
+## 4. Firmware Behavior
 
-1. Create a new Wokwi ESP32 project (or open this one if shared as a project link).
-2. Make sure `diagram.json`, `sketch.ino`, and `libraries.txt` are all present.
-3. Press the green "Play" (▶) button to build and run.
-4. Wokwi reads `libraries.txt` and auto-installs `PubSubClient` and `Adafruit NeoPixel` before compiling — no manual steps needed in the simulator.
-5. Wokwi's simulated WiFi has real internet access, so MQTT will actually connect if your broker is reachable from the internet (see Section 6).
+### 4.1 Arming
+The system is **armed at night** (LDR = dark). The mobile app can also force `auto` / `on` / `off`.
 
-**If you get `fatal error: <Library>.h: No such file or directory`:** it means `libraries.txt` is missing, misspelled, or not in the same folder — double check it contains exactly:
-```
-PubSubClient
-Adafruit NeoPixel
-```
+### 4.2 Threat Levels
 
-## 5. Running on Real ESP32 Hardware (Arduino IDE)
+| Level | Trigger | Matrix | Red LED | Buzzer |
+|---|---|---|---|---|
+| **CLEAR** | No motion | Green breathing moon | OFF | OFF |
+| **CAUTION** | Radar only, sustained ≥ 2 s | Yellow border + inner pulse | Solid | OFF |
+| **DANGER** | PIR + radar simultaneous | Orange frame + flashing crosshair | Solid | OFF |
+| **ALERT** | Deterrent actively firing | Red blinking alarm (~2 Hz) | Fast strobe | Two-tone 2.5 kHz / 1.2 kHz |
+| **BOOTING** | WiFi not yet connected | Blue rotating spinner | OFF | OFF |
+| **OFFLINE** | WiFi lost after connect | Normal threat glyph + blinking blue corner pixel | — | — |
 
-1. Install the ESP32 board package: **Tools → Board → Boards Manager** → search `esp32` → install "esp32 by Espressif Systems".
-2. Select your board: **Tools → Board → ESP32 Arduino → ESP32 Dev Module** (or your specific board).
-3. Install libraries via **Sketch → Include Library → Manage Libraries**:
-   - `PubSubClient` (Nick O'Leary)
-   - `Adafruit NeoPixel` (Adafruit)
-4. For Arduino IDE, put `smart_coop_deterrent.ino` in a folder named
-   `smart_coop_deterrent` before opening it. Arduino sketches require the main `.ino`
-   file and its folder to have the same name.
-5. Wire the hardware exactly per the pinout table in Section 3.
-6. Edit the config block at the top of the sketch (Section 6 below) with your real WiFi and MQTT details.
-7. Select the correct COM port under **Tools → Port**, then Upload.
-8. Open **Tools → Serial Monitor** at `115200` baud to watch connection/status logs.
+- Matrix brightness auto-adjusts to ambient light (LDR): dim in darkness, bright in daylight, full during ALERT.
+- Button press: manual trigger + white flash acknowledgement on matrix.
+- Component toggles (radar, PIR, deterrent, matrix, buzzer) are available from the app and respected by the firmware immediately.
+
+### 4.3 Radar hold
+A detection is held for **4 seconds** (`RADAR_HOLD_MS`) after the last radar HIGH so the CAUTION state and the app’s radar dot stay visible instead of flickering off.
 
 ---
 
-## 6. Configuration
+## 5. Mobile App Connection (No Backend)
 
-At the top of `sketch.ino`, edit these before building:
+The app (`scpd-mobile/App.js`) is a React Native / Expo app. It discovers and talks to the ESP32 **directly** — no cloud, no broker.
 
-```cpp
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+### 5.1 Discovery
+1. Tries mDNS: `coop-plus.local`, `smart-coop.local` (best on iOS; Android may require manual IP).
+2. Scans a few common static IPs.
+3. Scans the **phone’s actual WiFi subnet** (requires `expo-network`).
+4. If discovery fails, enter the ESP32’s IP manually (shown in Serial Monitor at 115200 baud).
 
-const char* MQTT_BROKER   = "YOUR_BROKER_IP_OR_DOMAIN";
-const int   MQTT_PORT     = 1883;
-const char* MQTT_CLIENT_ID= "smart_coop_esp32";
-const char* MQTT_USER     = "coop_device";
-const char* MQTT_PASS     = "YOUR_STRONG_PASSWORD";
-```
+### 5.2 Live Communication
+- **HTTP REST:** `GET /api/status`, `POST /api/commands/deterrent`, `POST /api/commands/arm`, `POST /api/commands/toggle_component`, `DELETE /api/events`, `DELETE /api/events/<id>`
+- **WebSocket:** `ws://<host>:80/ws` pushes live status updates.
 
-For the LDR module, set the small onboard trimmer to choose its dark/light switching
-point. Then run the sketch's `status` serial command while covering and uncovering
-the sensor. Set `LDR_DARK_WHEN_HIGH` in the sketch to match the result. Wokwi's LDR
-module outputs HIGH in darkness by default.
+Both run on **port 80**. The phone and ESP32 must be on the **same LAN**.
 
 ---
 
-## 7. Setting Up Your Own MQTT Broker (Mosquitto)
+## 6. Quick Start
 
-The firmware is built for a **private, authenticated broker** (not a public test broker) — appropriate since this system controls a physical door lock.
+### Wokwi (simulation)
+1. Open the project in Wokwi.
+2. Ensure `diagram.json`, `smart_coop_deterrent.ino`, and `libraries.txt` are present.
+3. Press Play. Wokwi auto-installs the listed libraries.
 
-On a Raspberry Pi, home server, or small cloud VM (DigitalOcean, Lightsail, etc.):
+### Real hardware (Arduino IDE / CLI)
+1. Install the ESP32 board package (Espressif Systems).
+2. Select **ESP32 Dev Module** (or your board).
+3. Place `smart_coop_deterrent.ino` in a folder named `smart_coop_deterrent`.
+4. Edit the WiFi block at the top of the sketch with your SSID and password.
+5. Upload; open Serial Monitor at **115200 baud** to watch the connection logs and the printed local IP.
 
+### Mobile app
 ```bash
-sudo apt update
-sudo apt install mosquitto mosquitto-clients -y
-
-# Create a device login
-sudo mosquitto_passwd -c /etc/mosquitto/passwd coop_device
-# (enter a strong password — use this same password in MQTT_PASS in the sketch)
+cd scpd-mobile
+npx expo install expo-network   # required for subnet-aware discovery
+npx expo start
 ```
-
-Edit `/etc/mosquitto/conf.d/default.conf`:
-```
-listener 1883
-allow_anonymous false
-password_file /etc/mosquitto/passwd
-```
-
-Restart and enable on boot:
-```bash
-sudo systemctl restart mosquitto
-sudo systemctl enable mosquitto
-```
-
-**Networking notes:**
-- Same home WiFi as the ESP32 → use the machine's local IP for `MQTT_BROKER`.
-- Want app control from outside the house → put the broker on a cloud VM with a static IP or dynamic DNS name, and open port 1883 (or 8883 for TLS) in the firewall.
-- **Security upgrade for later:** add TLS on port 8883 (`WiFiClientSecure` in the sketch) once basic auth is confirmed working — recommended before this ever guards a real coop unattended.
-
-Quick test that your broker works, from your computer:
-```bash
-mosquitto_sub -h YOUR_BROKER_IP -u coop_device -P yourpassword -t "coop/#" -v
-```
-You should see status messages appear once the ESP32 boots and connects.
+Scan the QR with Expo Go (or run on a simulator). Tap **Connect**; if auto-detect misses, type the ESP32’s IP manually.
 
 ---
 
-## 8. MQTT Topic Reference (for the App/Software Team)
+## 7. Serial Test Commands
 
-### Published by the device (device → app)
+With the ESP32 connected to Serial Monitor (`115200` baud, `NL + CR` or line ending set appropriately):
 
-| Topic | Payload | Meaning |
-|---|---|---|
-| `coop/status/pir` | `"0"` / `"1"` | current motion sensor state |
-| `coop/status/light` | `"0"` / `"1"` | interpreted light state: `"1"` = dark |
-| `coop/status/armed` | `"0"` / `"1"` | is the deterrent system armed (dark/night or app-forced) |
-| `coop/alert/predator` | `"1"` | fired once per deterrent trigger event (motion detected while armed) |
-| `coop/status/online` | `"1"` (retained); `"0"` on unexpected disconnect (LWT) | device connectivity status — use this to show "online/offline" in the app |
-
-Status topics are published every ~5 seconds.
-
-### Subscribed by the device (app → device)
-
-| Topic | Payload | Effect |
-|---|---|---|
-| `coop/cmd/deterrent` | `"trigger"` | force-fire the lights/buzzer/matrix immediately, regardless of armed state |
-| `coop/cmd/arm` | `"auto"` / `"on"` / `"off"` | `auto` = system decides based on darkness (default); `on`/`off` = app overrides arming manually |
-
-The app should subscribe to `coop/status/#` and `coop/alert/#` for a live dashboard, and publish to the `coop/cmd/*` topics to control the device.
+| Command | Effect |
+|---|---|
+| `help` | Print this menu |
+| `status` | Full system status report |
+| `led` | Blink the red alert LED 3× |
+| `buzzer` | 2-second buzzer test |
+| `matrix` | Cycle through all matrix states |
+| `telemetry` | Live sensor stream |
+| `ldr_calib` | Calibrate LDR dark threshold |
 
 ---
 
-## 9. Behavior Logic Summary
-
-1. **Day/night detection:** the LDR module's `DO` pin indicates darkness → system auto-arms.
-2. **Motion while armed:** PIR trigger → deterrent fires: red LED on, buzzer tone, fast strobing "eyes" on the matrix, for `DETERRENT_DURATION_MS` (default 5 seconds). A `coop/alert/predator` message is published once per trigger, with a cooldown (`TRIGGER_COOLDOWN_MS`, default 3s) so it doesn't spam re-triggers from the same event.
-3. **Manual button press:** debounced and edge-triggered (won't repeat-fire if held down) — always fires the deterrent regardless of armed state (useful for testing), plus gives a brief white-flash acknowledgement on the matrix so you know the press registered.
-4. **App override:** `coop/cmd/arm` can force arming on/off regardless of light level; `coop/cmd/deterrent` gives a direct manual test trigger any time.
-
-## 9b. Matrix Display States (System "Face")
-
-The 8x8 matrix acts as an at-a-glance status display, so someone checking on the coop doesn't need the app open. It runs as a non-blocking state machine — animations never stall sensor reads or MQTT:
-
-| State | Visual | Meaning |
-|---|---|---|
-| Booting | Slow blue dot circling the border | WiFi/MQTT still connecting |
-| Disarmed idle | Dim static "sun" glyph | Daytime, watching but not armed |
-| Armed idle | Soft "breathing" blue moon (slow brightness pulse) | Nighttime, actively protecting, calm state |
-| Alert | Fast strobing red "eyes", full brightness | Predator detected — this is the actual deterrent effect |
-| (any state) | Brief full white flash overlay | Confirms a manual button press was registered |
-
-The WiFi status LED also communicates connection stages: slow blink = no WiFi, fast blink = WiFi connected but MQTT still connecting, solid = fully connected.
-
----
-
-## 10. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `fatal error: PubSubClient.h: No such file or directory` | Missing `libraries.txt` (Wokwi) or libraries not installed (Arduino IDE) — see Section 4/5. |
-| ESP32 won't connect to WiFi | Check `WIFI_SSID`/`WIFI_PASSWORD` spelling; ESP32 only supports 2.4GHz networks, not 5GHz. |
-| MQTT won't connect, `rc=` error printed in Serial Monitor | Check broker IP/port reachability, and that `MQTT_USER`/`MQTT_PASS` match what you created with `mosquitto_passwd`. Common `rc` codes: `-2` = network unreachable, `5` = not authorized (bad credentials). |
-| System arms in bright light or stays disarmed in darkness | `LDR_DARK_WHEN_HIGH` is backwards, or the module trimmer threshold needs adjustment. Use the `status` serial command while covering/uncovering the sensor. |
-| Deterrent never fires | Confirm `armed` is true (check `coop/status/armed`), and that the PIR sensor's sensitivity/delay potentiometers (on real hardware) aren't set too low/long. |
-| App shows device "offline" even though it's running | Broker LWT (`coop/status/online`) only flips to `1` after a successful MQTT connect — check WiFi/MQTT connection logs in Serial Monitor. |
+| App can’t discover the device | Phone and ESP32 are on different subnets, or AP/client isolation is on. Enter the ESP32’s IP manually (shown in Serial Monitor). |
+| App connects but “Connecting…” flickers / kicks back to Home | Auto-reconnect now runs silently in the background; reload the app. If it persists, the firmware’s WiFi is flapping — check signal strength. |
+| Matrix is blank / wrong size | Confirm DIN/CS/CLK wiring and that the matrix is powered from a separate 5 V supply, not the ESP32’s USB pin. |
+| Buzzer quiet or clicking | Passive buzzer on GPIO 26 + GND. If using an active buzzer, the pitch sweep won’t work — swap to passive. |
+| Deterrent never fires | Check `armed` state (Serial `status`), LDR dark threshold, and that radar/PIR toggles are enabled in the app. |
+| Events/activities not clearing | Use the trash icon on individual events, or the **Clear** button in History. Both now hit firmware endpoints and refresh automatically. |
 
 ---
 
-## 11. Possible Future Improvements
+## 9. Design Notes (for the poster / reviewers)
 
-- TLS-encrypted MQTT (port 8883) for production security.
-- OTA (over-the-air) firmware updates so you don't need a USB cable for future changes.
-- Battery + solar power monitoring if the coop isn't near a wall outlet.
-- Additional predator-specific deterrent patterns (different matrix animations, varied buzzer tones) if certain animals prove more persistent.
-- Local SD card logging of trigger events as a backup to MQTT.
+- **No cloud dependency.** The ESP32 hosts its own API; the phone talks to it directly. If the internet goes down, the coop still works locally.
+- **Sensors are toggleable.** Radar, PIR, deterrent, matrix, and buzzer can all be switched off from the app — useful for testing or quiet hours.
+- **8×8 matrix is the primary local HCI.** Color code: green = safe, yellow = caution, orange = danger, red = alert, blue = booting/offline. The red LED stays solid for any active threat and strobes only while the siren fires.
+- **Radar hold = 4 s.** A single detection lingers on the display and in the app long enough to be useful, instead of vanishing after one sensor pulse.
+
+---
+
+## 10. Possible Future Improvements
+
+- TLS-encrypted API (`WiFiServerSecure`) for production.
+- OTA firmware updates.
+- Battery + solar monitoring if the coop isn’t near a wall outlet.
+- Per-animal deterrent patterns if certain predators prove more persistent.
+- Local SD-card event logging as a backup to the app.

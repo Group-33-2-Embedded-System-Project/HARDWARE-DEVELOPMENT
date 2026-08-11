@@ -7,10 +7,10 @@
   Hardware Setup:
     - RCWL-0516 Radar        -> GPIO 4  (3.3V OUT signal)
     - PIR Motion Sensor      -> GPIO 27 (3.3V OUT signal)
-    - Push Button            -> GPIO 26 (INPUT_PULLUP with 10kΩ resistor)
-    - LDR Module (DO pin)    -> GPIO 34 (Digital: dark detection)
-    - 8x8 LED Matrix         -> GPIO 5 (DIN), GPIO 17 (CS), GPIO 18 (CLK)
-    - Buzzer                 -> GPIO 33 (Active or passive)
+  - Push Button            -> GPIO 32 (INPUT_PULLUP with 10kΩ resistor)
+  - LDR Module (DO pin)    -> GPIO 34 (Digital: dark detection)
+  - 8x8 LED Matrix         -> GPIO 5 (DIN), GPIO 17 (CS), GPIO 18 (CLK)
+  - Buzzer                 -> GPIO 26 (Active or passive) + GND
     - Red Alert LED          -> GPIO 25 (Status)
     - WiFi Status LED        -> GPIO 2  (Connection indicator)
 
@@ -23,22 +23,24 @@
     ✅ Separate tracking for radar & PIR events
     ✅ Better state machine with threat escalation
     ✅ Serial debug with live sensor telemetry
-    ✅ MQTT threat level reporting
+    ✅ Local HTTP + WebSocket API (mobile app connects directly, no backend)
     ✅ Button ACK with visual confirmation
 
-  THREAT LEVEL SYSTEM:
-    CLEAR (Level 0):   No motion detected → green glyph
-    CAUTION (Level 1): Radar only active → yellow border
-    DANGER (Level 2):  PIR triggered, radar active → orange frame
-    ALERT (Level 3):   Full deterrent active → red flashing eyes
+   THREAT LEVEL SYSTEM (8x8 matrix + red LED colour code):
+     DISARMED:       System off, safe        → GREEN standby sun (dim)
+     CLEAR (Level 0):   No motion, armed      → GREEN breathing moon
+     CAUTION (Level 1): Radar only active     → YELLOW border + pulse
+     DANGER (Level 2):  PIR triggered, radar  → ORANGE frame + crosshair
+     ALERT (Level 3):   Full deterrent active → RED blinking alarm
+     BOOTING / OFFLINE:                       → BLUE (spinner / corner blink)
+     Red LED: solid for any active threat, strobing while the siren fires.
+
 
   ==========================================================
 */
 
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <ESPmDNS.h>
-#include <PubSubClient.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/sha1.h>
 // Using a small MAX7219 driver (shiftOut) instead of LedControl — compatible with ESP32
@@ -47,32 +49,22 @@
 const char* WIFI_SSID     = "P4X";
 const char* WIFI_PASSWORD = "dvorack1844l5";
 
-const char* MQTT_BROKER   = "192.168.26.160";
-const int   MQTT_PORT     = 1883;
-const char* MQTT_CLIENT_ID= "smart_coop_esp32";
-const char* MQTT_USER     = "coop_device";
-const char* MQTT_PASS     = "password123";
-
-// MQTT Topics
-const char* TOPIC_PIR           = "coop/status/pir";
-const char* TOPIC_RADAR         = "coop/status/radar";
-const char* TOPIC_LIGHT         = "coop/status/light";
-const char* TOPIC_THREAT_LEVEL  = "coop/status/threat_level";
-const char* TOPIC_ARMED         = "coop/status/armed";
-const char* TOPIC_ALERT         = "coop/alert/predator";
-const char* TOPIC_ONLINE        = "coop/status/online";
-const char* TOPIC_CMD_DETERRENT = "coop/cmd/deterrent";
-const char* TOPIC_CMD_ARM       = "coop/cmd/arm";
-
 // ==================== PIN DEFINITIONS ====================
 #define PIN_RADAR      4
 #define PIN_PIR        27
-#define PIN_BUTTON     26
+#define PIN_BUTTON     32   // moved off 26 (now the buzzer) to avoid conflict
 #define PIN_LDR        34
 #define PIN_MATRIX_DIN 5
 #define PIN_MATRIX_CS  17
 #define PIN_MATRIX_CLK 18
-#define PIN_BUZZER     33
+#define PIN_BUZZER     26   // buzzer + GND (matches working test wiring)
+// Buzzer is driven via a dedicated LEDC channel so we can sweep frequency
+// with ledcSetup() — which reconfigures the timer WITHOUT detaching the pin.
+// Repeated tone() calls on ESP32 disconnected the pin every step, which caused
+// the clicks/glitches and dropped perceived volume.
+#define BUZZER_LEDC_CHANNEL 0
+#define BUZZER_LEDC_RES     10      // 10-bit resolution → smooth pitch sweep
+#define BUZZER_DUTY         512     // 50% of 1024 → full square wave (loudest)
 #define PIN_LED_RED    25
 #define PIN_LED_WIFI   2
 #define PIN_BATTERY    35
@@ -87,16 +79,16 @@ const char* TOPIC_CMD_ARM       = "coop/cmd/arm";
 #define DETERRENT_DURATION_MS 5000
 #define RADAR_CAUTION_MS 2000    // Time radar alone triggers caution
 #define RADAR_DEBOUNCE_MS 80     // Debounce / stability window for RCWL-0516
+#define RADAR_HOLD_MS 4000       // Keep "radar detected" lit this long after last HIGH
 #define TRIGGER_COOLDOWN_MS 3000
-#define STATUS_PUBLISH_INTERVAL_MS 5000
 #define WIFI_RETRY_INTERVAL_MS 30000
 #define BUTTON_DEBOUNCE_MS 50
 #define BUTTON_ACK_MS 300
 #define BUTTON_ACK_BRIGHTNESS 40
 
-#define SIREN_MIN_HZ 900
-#define SIREN_MAX_HZ 2200
-#define SIREN_SWEEP_MS 700   // Longer sweep = smoother, more natural wail
+#define SIREN_HIGH_HZ 2500   // high tone of the two-tone alarm
+#define SIREN_LOW_HZ  1200   // low tone of the two-tone alarm
+#define SIREN_TONE_MS 350    // duration of each tone before switching
 
 // ==================== THREAT LEVELS ====================
 enum ThreatLevel {
@@ -117,12 +109,7 @@ enum SystemState {
 };
 
 // ==================== GLOBAL OBJECTS ====================
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
 WiFiServer apiServer(80);
-WiFiUDP udpDiscovery;
-bool udpStarted = false;
-const uint16_t UDP_DISCOVERY_PORT = 8888;
 
 struct LocalCommandEntry {
   uint32_t id;
@@ -251,7 +238,6 @@ bool armOverrideValue = false;
 bool deterrentActive = false;
 unsigned long deterrentStartTime = 0;
 unsigned long lastTriggerTime = 0;
-unsigned long lastStatusPublish = 0;
 unsigned long lastWiFiAttempt = 0;
 
 // Sensor state tracking
@@ -265,6 +251,8 @@ int stableRadarState = LOW;         // debounced/stable radar state
 
 unsigned long radarActiveStart = 0;
 bool radarCautionTriggered = false;
+unsigned long radarHoldUntil = 0;   // keeps "radar detected" lit for RADAR_HOLD_MS
+bool lastRadarPresent = false;      // edge tracking for the held state
 
 // Button debouncing
 int lastButtonReading = HIGH;
@@ -315,6 +303,13 @@ void setup() {
   digitalWrite(PIN_LED_RED, LOW);
   digitalWrite(PIN_LED_WIFI, LOW);
 
+  // Configure the buzzer LEDC channel ONCE. We keep the pin attached and only
+  // re-run ledcSetup() with a new frequency from here on (no pin detach), so the
+  // siren sweep stays continuous and click-free.
+  ledcSetup(BUZZER_LEDC_CHANNEL, (double)SIREN_LOW_HZ, BUZZER_LEDC_RES);
+  ledcAttachPin(PIN_BUZZER, BUZZER_LEDC_CHANNEL);
+  ledcWrite(BUZZER_LEDC_CHANNEL, 0); // start silent
+
   // Initialize 8x8 LED matrix
   matrix.begin();
   matrix.clear();
@@ -326,11 +321,6 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   startWiFiConnection();
-
-  // MQTT setup
-  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-  mqttClient.setSocketTimeout(2);
-  mqttClient.setCallback(mqttCallback);
 
   apiServer.begin();
   apiServerStarted = true;
@@ -345,7 +335,7 @@ void setup() {
 // ==========================================================
 void loop() {
   handleSerialTestMode();
-  handleWiFiAndMQTT();
+  handleNetwork();
   handleLocalApi();
 
   bool isDark = readIsDark();
@@ -356,16 +346,13 @@ void loop() {
   handleButton();
   updateDeterrent();
   updateThreatLevel();
+  updateIndicatorLeds();
   updateSystemStateIfIdle();
   // Update brightness BEFORE rendering so per-state breathing effects can change global intensity
   updateMatrixBrightness();
   updateMatrixDisplay();
 
   unsigned long now = millis();
-  if (now - lastStatusPublish > STATUS_PUBLISH_INTERVAL_MS) {
-    publishStatus();
-    lastStatusPublish = now;
-  }
 
   // Read battery voltage every 30 seconds
   static unsigned long lastBatteryRead = 0;
@@ -492,6 +479,17 @@ void recordLocalEvent(const String& type, const String& title, const String& det
 
 void clearLocalEvents() {
   localEventCount = 0;
+}
+
+bool removeLocalEvent(uint32_t id) {
+  for (int i = 0; i < localEventCount; ++i) {
+    if (localEvents[i].id == id) {
+      for (int j = i + 1; j < localEventCount; ++j) localEvents[j - 1] = localEvents[j];
+      localEventCount--;
+      return true;
+    }
+  }
+  return false;
 }
 
 String statusJson() {
@@ -803,6 +801,17 @@ void handleHttpRequest(WiFiClient& client, const String& method, String path, co
     return;
   }
 
+  if (method == "DELETE" && path.startsWith("/api/events/")) {
+    uint32_t id = path.substring(String("/api/events/").length()).toInt();
+    if (removeLocalEvent(id)) {
+      broadcastLocalStatus(true);
+      sendHttpJson(client, 200, "{\"deleted\":true}");
+    } else {
+      sendHttpJson(client, 404, "{\"error\":\"Event not found.\"}");
+    }
+    return;
+  }
+
   if (method == "GET" && path == "/api/commands") {
     sendHttpJson(client, 200, String("{\"commands\":") + commandsJson() + "}");
     return;
@@ -970,21 +979,21 @@ int batteryPercentFromVoltage(float voltage) {
 }
 
 void updateMatrixBrightness() {
-  // Auto-adjust matrix brightness based on ambient light
-  // Darker environment = lower brightness to avoid glare
-  int raw = digitalRead(PIN_LDR);
+  // Auto-adjust matrix brightness based on ambient light (darker = dimmer)
   bool isDark = readIsDark();
-  
-  if (isDark) {
-    matrixBrightness = 40;  // Reduce brightness in darkness
-  } else {
-    matrixBrightness = 120; // Increase in daylight
-  }
+  int base = isDark ? 40 : 120;
 
   if (deterrentActive || currentState == STATE_ALERT) {
-    matrixBrightness = 255; // Full brightness during alert
+    base = 255;                                  // full brightness during alert
+  } else if (currentState == STATE_ARMED_CLEAR) {
+    // Gentle "breathing" layered on top of the ambient base, so the LDR
+    // dimming still applies (previously drawArmedClear overrode it).
+    float phase   = (millis() % 3000) / 3000.0f;
+    float breathe = 0.6f + 0.4f * (phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f);
+    base = (int)(base * breathe);
   }
 
+  matrixBrightness = base;
   matrix.setBrightness(matrixBrightness);
 }
 
@@ -992,6 +1001,16 @@ void updateMatrixBrightness() {
 // SENSOR HANDLING - RADAR (RCWL-0516)
 // ==========================================================
 void handleRadarSensor() {
+  // Disabled via app/serial toggle — contribute nothing to threat logic
+  if (!radarEnabled) {
+    stableRadarState = LOW;
+    lastRadarState   = LOW;
+    lastRadarRaw     = LOW;
+    radarHoldUntil   = 0;
+    lastRadarPresent = false;
+    return;
+  }
+
   // Read raw input and debounce to produce a stableRadarState suitable for logic
   int radarRawSample = digitalRead(PIN_RADAR);
   if (radarRawSample != lastRadarRaw) {
@@ -999,55 +1018,52 @@ void handleRadarSensor() {
     lastRadarRawChange = millis();
   }
 
-  bool radarTransition = false;
-  // Accept a change only if it has been stable for the debounce window
   if (lastRadarRaw != stableRadarState && (millis() - lastRadarRawChange) > RADAR_DEBOUNCE_MS) {
     stableRadarState = lastRadarRaw;
-    radarTransition = true;
     Serial.print("📡 RADAR: Stable -> "); Serial.println(stableRadarState == HIGH ? "HIGH" : "LOW");
-
-    // Publish immediate radar event for quicker remote visibility
-    if (mqttClient.connected()) {
-      mqttClient.publish(TOPIC_RADAR, stableRadarState == HIGH ? "1" : "0");
-    }
   }
 
-  // Use debounced/stable state for threat evaluation
-  if (armed && stableRadarState == HIGH) {
-    if (radarTransition) {
+  // Hold the "detected" state for a short window after the last HIGH so the UI
+  // dot and CAUTION level stay visible instead of flickering off the instant
+  // the sensor's output drops.
+  if (stableRadarState == HIGH) radarHoldUntil = millis() + RADAR_HOLD_MS;
+  bool radarPresent = (stableRadarState == HIGH) || (millis() < radarHoldUntil);
+  bool radarPresentTransition = (radarPresent != lastRadarPresent);
+
+  if (armed && radarPresent) {
+    if (radarPresentTransition) {
       radarActiveStart = millis();
       radarCautionTriggered = false;
       Serial.println("📡 RADAR: Motion detected (stable)!");
     }
-
-    // Trigger CAUTION after RADAR_CAUTION_MS of continuous stable radar
     unsigned long radarDuration = millis() - radarActiveStart;
     if (!radarCautionTriggered && radarDuration > RADAR_CAUTION_MS) {
       radarCautionTriggered = true;
       currentThreatLevel = THREAT_CAUTION;
       recordLocalEvent("radar", "Radar Motion Detected", "RCWL-0516 microwave radar detected movement nearby", 1);
       Serial.println("📡 RADAR: Sustained motion - CAUTION level");
-      if (mqttClient.connected()) {
-        char buf[4]; snprintf(buf, sizeof(buf), "%d", currentThreatLevel);
-        mqttClient.publish(TOPIC_THREAT_LEVEL, buf);
-      }
     }
-  }
-  else if (stableRadarState == LOW && radarTransition) {
-    Serial.println("📡 RADAR: Clear (stable)");
+  } else if (!radarPresent && radarPresentTransition) {
     radarCautionTriggered = false;
     if (currentThreatLevel == THREAT_CAUTION && lastPirState == LOW) {
       currentThreatLevel = THREAT_CLEAR;
     }
   }
 
-  lastRadarState = stableRadarState;
+  lastRadarPresent = radarPresent;
+  lastRadarState   = radarPresent ? HIGH : LOW;
 }
 
 // ==========================================================
 // SENSOR HANDLING - PIR (Traditional Motion)
 // ==========================================================
 void handlePIRSensor() {
+  // Disabled via app/serial toggle — do not trigger or escalate
+  if (!pirEnabled) {
+    lastPirState = LOW;
+    return;
+  }
+
   int pirState = digitalRead(PIN_PIR);
   bool pirTransition = (pirState != lastPirState);
 
@@ -1067,10 +1083,6 @@ void handlePIRSensor() {
       
       triggerDeterrent();
       lastTriggerTime = now;
-      
-      if (mqttClient.connected()) {
-        mqttClient.publish(TOPIC_ALERT, "1");
-      }
     }
   }
 
@@ -1135,65 +1147,75 @@ void updateThreatLevel() {
 // DETERRENT (Lights + Siren)
 // ==========================================================
 void triggerDeterrent() {
+  if (!deterrentEnabled) return;   // deterrent switched off via toggle
   deterrentActive = true;
   deterrentStartTime = millis();
   currentThreatLevel = THREAT_ALERT;
   currentState = STATE_ALERT;
-  digitalWrite(PIN_LED_RED, HIGH);
   recordLocalEvent("deterrent", "Deterrent Activated", "Strobe lights & high-decibel siren engaged", 3);
   Serial.println("🚨 DETERRENT TRIGGERED!");
 }
 
-// Cached siren state — only call tone()/noTone() when values actually change
-// to prevent LEDC timer resets that create click/glitch artifacts.
+// Cached siren state — used to avoid re-writing the LEDC frequency more often
+// than necessary (keeps the sweep smooth without hammering the peripheral).
 static int   lastSirenFreq = 0;
 static bool  lastSirenOn   = false;
 
+// Silence the buzzer cleanly by setting duty to 0 (no pin detach / timer reset).
+void buzzerSilence() {
+  ledcWrite(BUZZER_LEDC_CHANNEL, 0);
+  lastSirenOn   = false;
+  lastSirenFreq = 0;
+}
+
 void updateSiren() {
   unsigned long elapsed   = millis() - deterrentStartTime;
-  // Two-cycle wail: 600ms rising + 600ms falling per 1200ms period
-  unsigned long period    = 1200UL;
-  unsigned long phase     = elapsed % period;
-  float t = (float)phase / period;           // 0.0 → 1.0
-  // Smooth triangle: up for first half, down for second half
-  float ramp = (t < 0.5f) ? (t * 2.0f) : (2.0f - t * 2.0f);
-  // Ease in/out with a sine-like curve for a cleaner sound transition
-  ramp = ramp * ramp * (3.0f - 2.0f * ramp); // smoothstep
-  int targetFreq = SIREN_MIN_HZ + (int)(ramp * (SIREN_MAX_HZ - SIREN_MIN_HZ));
+  // Simple two-tone alarm: alternate HIGH and LOW pitches (no sweeping wail).
+  unsigned long cycle    = (unsigned long)SIREN_TONE_MS * 2;
+  unsigned long phase     = elapsed % cycle;
+  int targetFreq = (phase < (unsigned long)SIREN_TONE_MS) ? SIREN_HIGH_HZ : SIREN_LOW_HZ;
 
-  // 100ms silence gap at the very end of each 1200ms cycle (brief breath)
-  bool shouldBeOn = (phase < (period - 100UL));
-
-  // Only call tone()/noTone() when state actually changes — prevents PWM-timer
-  // resets that cause audible clicks on every main-loop iteration.
-  if (shouldBeOn) {
-    if (!lastSirenOn || abs(targetFreq - lastSirenFreq) > 10) {
-      tone(PIN_BUZZER, targetFreq);
-      lastSirenFreq = targetFreq;
-      lastSirenOn   = true;
-    }
-  } else {
-    if (lastSirenOn) {
-      noTone(PIN_BUZZER);
-      lastSirenOn = false;
-    }
+  // Only touch the LEDC channel when the tone actually changes. ledcSetup()
+  // reconfigures the timer WITHOUT detaching the pin, so switching is clean
+  // (no clicks) and the 50% duty keeps the volume high.
+  if (targetFreq != lastSirenFreq) {
+    ledcSetup(BUZZER_LEDC_CHANNEL, (double)targetFreq, BUZZER_LEDC_RES);
+    ledcWrite(BUZZER_LEDC_CHANNEL, BUZZER_DUTY);
+    lastSirenFreq = targetFreq;
+  }
+  if (!lastSirenOn) {
+    ledcWrite(BUZZER_LEDC_CHANNEL, BUZZER_DUTY); // 50% duty square wave
+    lastSirenOn = true;
+  }
+  if (!lastSirenOn) {
+    ledcWrite(BUZZER_LEDC_CHANNEL, BUZZER_DUTY); // 50% duty square wave
+    lastSirenOn = true;
   }
 }
 
 void updateDeterrent() {
   if (!deterrentActive) return;
-  if (!buzzerEnabled) { noTone(PIN_BUZZER); lastSirenOn = false; return; }
+  if (!buzzerEnabled) { buzzerSilence(); return; }
 
   unsigned long elapsed = millis() - deterrentStartTime;
   updateSiren();
   
   if (elapsed > DETERRENT_DURATION_MS) {
     deterrentActive = false;
-    digitalWrite(PIN_LED_RED, LOW);
-    noTone(PIN_BUZZER);
-    lastSirenOn   = false;
-    lastSirenFreq = 0;
+    buzzerSilence();
     Serial.println("✓ Deterrent cycle complete");
+  }
+}
+
+// Red alert LED: solid whenever there is an active threat, and strobing while
+// the deterrent burst is actually firing. (WiFi LED is driven in handleNetwork.)
+void updateIndicatorLeds() {
+  if (deterrentActive) {
+    digitalWrite(PIN_LED_RED, (millis() / 90) % 2);          // fast strobe during siren
+  } else if (currentThreatLevel >= THREAT_CAUTION) {
+    digitalWrite(PIN_LED_RED, HIGH);                         // persistent threat cue
+  } else {
+    digitalWrite(PIN_LED_RED, LOW);
   }
 }
 
@@ -1204,7 +1226,7 @@ void updateSystemStateIfIdle() {
   }
 
   if (currentState == STATE_BOOTING) {
-    if (mqttClient.connected()) {
+    if (WiFi.status() == WL_CONNECTED) {
       currentState = armed ? STATE_ARMED_CLEAR : STATE_DISARMED_IDLE;
     }
     return;
@@ -1271,41 +1293,37 @@ void drawBootingSpinner() {
 }
 
 void drawDisarmedIdle() {
-  // Sun glyph - system disarmed
-  uint32_t yellow = matrix.Color(100, 80, 0);
-  setPixelXY(3, 3, yellow); setPixelXY(3, 4, yellow);
-  setPixelXY(4, 3, yellow); setPixelXY(4, 4, yellow);
-  setPixelXY(1, 3, yellow); setPixelXY(1, 4, yellow);
-  setPixelXY(6, 3, yellow); setPixelXY(6, 4, yellow);
-  setPixelXY(3, 1, yellow); setPixelXY(4, 1, yellow);
-  setPixelXY(3, 6, yellow); setPixelXY(4, 6, yellow);
+  // GREEN standby sun — disarmed but safe. Dimmer green than the armed-clear
+  // moon, which breathes, so "off" vs "actively monitoring" stays readable.
+  uint32_t green = matrix.Color(0, 120, 0);
+  setPixelXY(3, 3, green); setPixelXY(3, 4, green);
+  setPixelXY(4, 3, green); setPixelXY(4, 4, green);
+  setPixelXY(1, 3, green); setPixelXY(1, 4, green);
+  setPixelXY(6, 3, green); setPixelXY(6, 4, green);
+  setPixelXY(3, 1, green); setPixelXY(4, 1, green);
+  setPixelXY(3, 6, green); setPixelXY(4, 6, green);
 }
 
 void drawArmedClear() {
-  // Breathing moon - all quiet
-  float phase = (millis() % 3000) / 3000.0;
-  int b = 40 + (int)(60 * (phase < 0.5 ? phase * 2 : (1 - phase) * 2));
-  // Set global intensity to create breathing effect on MAX7219
-  matrix.setBrightness(b);
-
-  uint32_t blue = matrix.Color(20, 50, 255);
+  // GREEN breathing moon — system armed and all quiet (safe)
+  uint32_t green = matrix.Color(0, 200, 0);
   int crescent[][2] = {{2,4},{2,5},{3,3},{3,6},{4,3},{4,6},{5,3},{5,6},{6,4},{6,5}};
-  for (auto &p : crescent) setPixelXY(p[0], p[1], blue);
+  for (auto &p : crescent) setPixelXY(p[0], p[1], green);
 }
 
 void drawArmedCaution() {
-  // Yellow border - radar active
+  // YELLOW border + inner pulse - radar only (caution)
   uint32_t yellow = matrix.Color(255, 200, 0);
   drawBorder(yellow);
-  
+
   // Pulsing inner dots
   unsigned long pulse = (millis() / 300) % 2;
   if (pulse) {
-    uint32_t orange = matrix.Color(255, 150, 0);
-    setPixelXY(3, 3, orange);
-    setPixelXY(3, 4, orange);
-    setPixelXY(4, 3, orange);
-    setPixelXY(4, 4, orange);
+    uint32_t yellowBright = matrix.Color(255, 235, 60);
+    setPixelXY(3, 3, yellowBright);
+    setPixelXY(3, 4, yellowBright);
+    setPixelXY(4, 3, yellowBright);
+    setPixelXY(4, 4, yellowBright);
   }
 }
 
@@ -1321,24 +1339,16 @@ void drawArmedDanger() {
 }
 
 void drawAlert() {
-  // Animated red eyes - scanning and pulsing for urgency
+  // Bold, glanceable RED alarm: solid red border + center block, blinking
+  // clearly (~2 Hz) so it reads as "danger" from a distance. No subtle
+  // twinkle — that read as decoration, not emergency.
   uint32_t red = matrix.Color(255, 0, 0);
-  unsigned long t = millis();
-  // Scanning offset cycles 0..3
-  int scan = (t / 180) % 4;
-  // Pulsing visibility (on most of the time, short off gaps create blink)
-  bool visible = (t / 120) % 5 != 0;
-  if (!visible) return;
-
-  // Eyes positions move left-right within a small window
-  int leftCol = 2 + (scan % 3);   // 2..4
-  int rightCol = 5 - (scan % 3);  // 5..3
-
-  setPixelXY(2, leftCol, red); setPixelXY(2, rightCol, red);
-  setPixelXY(3, leftCol, red); setPixelXY(3, rightCol, red);
-  setPixelXY(4, leftCol-1, red); setPixelXY(4, rightCol+1, red);
-  setPixelXY(5, leftCol-1, red); setPixelXY(5, rightCol+1, red);
-  setPixelXY(6, leftCol, red); setPixelXY(6, rightCol, red);
+  bool on = ((millis() / 250) % 2 == 0);   // ~2 Hz clear blink
+  if (!on) return;
+  drawBorder(red);
+  for (int r = 3; r <= 4; r++)
+    for (int c = 3; c <= 4; c++)
+      setPixelXY(r, c, red);
 }
 
 void drawButtonAckOverlay() {
@@ -1356,6 +1366,12 @@ void drawButtonAckOverlay() {
 
 void updateMatrixDisplay() {
   matrix.clear();
+
+  // Matrix switched off via toggle — leave the panel dark
+  if (!matrixEnabled) {
+    matrix.show();
+    return;
+  }
 
   switch (currentState) {
     case STATE_BOOTING:
@@ -1382,60 +1398,31 @@ void updateMatrixDisplay() {
     drawButtonAckOverlay();
   }
 
+  // Offline marker: if we've lost the WiFi link to the app, blink a blue
+  // pixel in the corner so the device itself says "not connected".
+  if (WiFi.status() != WL_CONNECTED && (millis() / 500) % 2 == 0) {
+    setPixelXY(0, 0, matrix.Color(0, 60, 255));
+  }
+
   matrix.show();
 }
 
 // ==========================================================
-// WiFi & MQTT
+// WiFi / Network services (no backend — the mobile app talks
+// to this device directly over HTTP + WebSocket + mDNS)
 // ==========================================================
-void handleWiFiAndMQTT() {
+void handleNetwork() {
   if (WiFi.status() != WL_CONNECTED) {
     digitalWrite(PIN_LED_WIFI, (millis() / 300) % 2);
     startWiFiConnection();
   } else {
+    digitalWrite(PIN_LED_WIFI, HIGH);
     if (!mdnsStarted) {
       if (MDNS.begin("coop-plus")) {
         MDNS.addService("http", "tcp", 80);
         mdnsStarted = true;
         Serial.println("✓ mDNS Responder started: http://coop-plus.local");
       }
-    }
-    if (!udpStarted) {
-      if (udpDiscovery.begin(UDP_DISCOVERY_PORT)) {
-        udpStarted = true;
-        Serial.println("✓ UDP Discovery Responder listening on port 8888");
-      }
-    }
-    handleUdpDiscovery();
-    if (!mqttClient.connected()) {
-      digitalWrite(PIN_LED_WIFI, (millis() / 150) % 2);
-      connectMQTT();
-    } else {
-      digitalWrite(PIN_LED_WIFI, HIGH);
-      mqttClient.loop();
-    }
-  }
-}
-
-void handleUdpDiscovery() {
-  if (!udpStarted) return;
-  int packetSize = udpDiscovery.parsePacket();
-  if (packetSize) {
-    char packetBuffer[128];
-    int len = udpDiscovery.read(packetBuffer, sizeof(packetBuffer) - 1);
-    if (len > 0) packetBuffer[len] = 0;
-    
-    String req = String(packetBuffer);
-    req.toLowerCase();
-    
-    if (req.indexOf("coop") >= 0 || req.indexOf("discover") >= 0 || req.length() > 0) {
-      String ip = WiFi.localIP().toString();
-      String response = "{\"name\":\"Coop+\",\"ip\":\"" + ip + "\",\"port\":80,\"type\":\"smart-coop\"}";
-      
-      udpDiscovery.beginPacket(udpDiscovery.remoteIP(), udpDiscovery.remotePort());
-      udpDiscovery.print(response);
-      udpDiscovery.endPacket();
-      Serial.print("📡 Responded to UDP discovery from "); Serial.println(udpDiscovery.remoteIP().toString());
     }
   }
 }
@@ -1444,56 +1431,9 @@ void startWiFiConnection() {
   if (WiFi.status() == WL_CONNECTED) return;
   if (lastWiFiAttempt != 0 && millis() - lastWiFiAttempt < WIFI_RETRY_INTERVAL_MS) return;
   lastWiFiAttempt = millis();
-  
+
   Serial.print("📡 Connecting to WiFi...");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-}
-
-void connectMQTT() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  static unsigned long lastAttempt = 0;
-  if (millis() - lastAttempt < 15000) return;
-  lastAttempt = millis();
-
-  Serial.print("📡 Connecting to MQTT broker...");
-  bool connected = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS,
-                                       TOPIC_ONLINE, 0, true, "0");
-  if (connected) {
-    Serial.println("✓ Connected");
-    mqttClient.publish(TOPIC_ONLINE, "1", true);
-    mqttClient.subscribe(TOPIC_CMD_DETERRENT);
-    mqttClient.subscribe(TOPIC_CMD_ARM);
-  } else {
-    Serial.print(" Failed (rc="); Serial.print(mqttClient.state()); Serial.println(")");
-  }
-}
-
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String msg;
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-  msg.trim();
-  String t = String(topic);
-
-  if (t == TOPIC_CMD_DETERRENT) {
-    if (msg == "trigger") triggerDeterrent();
-  } else if (t == TOPIC_CMD_ARM) {
-    if (msg == "auto") armOverride = false;
-    else if (msg == "on") { armOverride = true; armOverrideValue = true; }
-    else if (msg == "off") { armOverride = true; armOverrideValue = false; }
-  }
-}
-
-void publishStatus() {
-  if (!mqttClient.connected()) return;
-
-  char threatStr[2];
-  snprintf(threatStr, sizeof(threatStr), "%d", currentThreatLevel);
-
-  mqttClient.publish(TOPIC_PIR, lastPirState == HIGH ? "1" : "0");
-  mqttClient.publish(TOPIC_RADAR, lastRadarState == HIGH ? "1" : "0");
-  mqttClient.publish(TOPIC_LIGHT, readIsDark() ? "1" : "0");
-  mqttClient.publish(TOPIC_THREAT_LEVEL, threatStr);
-  mqttClient.publish(TOPIC_ARMED, armed ? "1" : "0");
 }
 
 // ==========================================================
@@ -1565,13 +1505,13 @@ void testBuzzer() {
 
   while (millis() - start < 2000) {
     if (buzzerEnabled) updateSiren();
-    else noTone(PIN_BUZZER);
+    else buzzerSilence();
     delay(25);
   }
 
   deterrentActive = savedDetActive;
   deterrentStartTime = savedDeterrentStart;
-  noTone(PIN_BUZZER);
+  buzzerSilence();
   Serial.println("✓ Buzzer test complete\n");
 }
 
@@ -1603,9 +1543,6 @@ void printSystemStatus() {
 
   Serial.print("║ WiFi:           ");
   Serial.println(WiFi.status() == WL_CONNECTED ? "✓ Connected  ║" : "✗ Offline    ║");
-
-  Serial.print("║ MQTT:           ");
-  Serial.println(mqttClient.connected() ? "✓ Connected  ║" : "✗ Disconnected ║");
 
   Serial.print("║ Local API:      ");
   Serial.println(apiServerStarted ? "✓ Ready      ║" : "✗ Offline    ║");
