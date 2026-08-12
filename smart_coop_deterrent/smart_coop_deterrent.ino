@@ -26,14 +26,24 @@
     ✅ Local HTTP + WebSocket API (mobile app connects directly, no backend)
     ✅ Button ACK with visual confirmation
 
-   THREAT LEVEL SYSTEM (8x8 matrix + red LED colour code):
-     DISARMED:       System off, safe        → GREEN standby sun (dim)
-     CLEAR (Level 0):   No motion, armed      → GREEN breathing moon
-     CAUTION (Level 1): Radar only active     → YELLOW border + pulse
-     DANGER (Level 2):  PIR triggered, radar  → ORANGE frame + crosshair
-     ALERT (Level 3):   Full deterrent active → RED blinking alarm
-     BOOTING / OFFLINE:                       → BLUE (spinner / corner blink)
-     Red LED: solid for any active threat, strobing while the siren fires.
+   THREAT LEVEL SYSTEM — 8x8 MATRIX HCI LANGUAGE
+   -------------------------------------------------------------
+   The 1088AS module is a SINGLE-COLOUR (red) matrix, so states are
+   communicated by SHAPE + MOTION, never by hue. Each state has a distinct,
+   learnable glyph and a blink cadence that rises with urgency, so the device
+   can be read at a glance and from a distance (good HCI practice):
+
+     BOOTING        → rotating perimeter dot          (working…)
+     DISARMED       → hollow ring  "○"   steady, dim   (inactive / neutral)
+     CLEAR (armed)  → shield      "🛡"   steady, breathing (protected, quiet)
+     CAUTION (L1)   → "?"         slow pulse 0.6 Hz    (radar saw something)
+     DANGER  (L2)   → "!"         blink 2.5 Hz         (motion confirmed)
+     ALERT   (L3)   → "✕"         fast blink 4 Hz      (deterrent firing)
+     OFFLINE        → blue corner pixel blinking        (link lost)
+
+   Urgency mapping is monotonic (○ → 🛡 → ? → ! → ✕) so operators build one
+   mental model: "more pixels moving faster = more danger".
+   Red status LED: solid for any active threat, strobing while the siren fires.
 
 
   ==========================================================
@@ -109,7 +119,12 @@ enum SystemState {
 };
 
 // ==================== GLOBAL OBJECTS ====================
-WiFiServer apiServer(80);
+// Allow several concurrent clients. The mobile app's subnet scan (and its
+// WebSocket + periodic HTTP status/commands) can open multiple sockets at once;
+// the ESP32 WiFiServer default of a single client causes connection-refused and
+// makes discovery miss the device.
+WiFiServer apiServer(80, 8);
+
 
 struct LocalCommandEntry {
   uint32_t id;
@@ -149,6 +164,11 @@ String lastLocalStatusSignature;
 // Provides a subset of the Adafruit_NeoPixel-like API used by the rest of this
 // sketch (setPixelColor, setBrightness, show, Color). This keeps the existing
 // drawing functions intact while driving a single 8x8 MAX7219 (1088AS) module.
+//
+// Drawing is double-buffered: setPixelColor() only touches the off-screen
+// 'rows' framebuffer, and show() pushes all 8 rows in one pass. This removes
+// the clear-then-redraw flicker the previous immediate-write version had, which
+// is important for legible, steady HCI feedback.
 class MatrixWrapper {
   public:
     MatrixWrapper(int dataPin, int clkPin, int csPin, int devices): mosiPin(dataPin), clkPin(clkPin), csPin(csPin), devices(devices), intensity(8) {
@@ -168,13 +188,11 @@ class MatrixWrapper {
       writeRegister(0x0F, 0x00); // Display test: off
       setIntensity(map(60, 0, 255, 0, 15));
       clear();
+      flush(); // push the cleared buffer to the hardware
     }
 
     void clear() {
-      for (int i = 0; i < 8; ++i) {
-        rows[i] = 0x00;
-        writeRegister(i + 1, 0x00);
-      }
+      for (int i = 0; i < 8; ++i) rows[i] = 0x00;
     }
 
     // Accept 0-255 like NeoPixel and map to MAX7219 0-15
@@ -184,8 +202,8 @@ class MatrixWrapper {
       setIntensity(intensity);
     }
 
-    // MAX7219 updates immediately; show is a no-op to match NeoPixel API
-    void show() { }
+    // Push the framebuffer to the MAX7219 in a single pass (no flicker).
+    void show() { flush(); }
 
     // index: 0..63 mapping row-major (row*8 + col)
     void setPixelColor(int index, uint32_t color) {
@@ -195,8 +213,6 @@ class MatrixWrapper {
 
       if (color != 0) rows[row] |= (1 << col);
       else rows[row] &= ~(1 << col);
-
-      writeRegister(row + 1, rows[row]);
     }
 
     // Create a nonzero color when any component > 0 so existing code can use matrix.Color(r,g,b)
@@ -222,6 +238,12 @@ class MatrixWrapper {
     }
 
     void setIntensity(int val) { writeRegister(0x0A, val & 0x0F); }
+
+    // Write every row of the framebuffer once. Cheap (8 SPI pairs) and avoids
+    // the partial-frame tearing you get from per-pixel hardware writes.
+    void flush() {
+      for (int i = 0; i < 8; ++i) writeRegister(i + 1, rows[i]);
+    }
 };
 
 // Instantiate the wrapper with the configured pins (single device)
@@ -316,7 +338,10 @@ void setup() {
   matrix.setBrightness(60);
   matrix.show();
 
-  // WiFi setup
+  // WiFi setup — station (infrastructure) mode. This is the architecture that
+  // was connecting reliably; auto-reconnect recovers the link if the router
+  // drops it. (A SoftAP fallback was tried but interfered with the station link
+  // on several boards, leaving the device stuck booting and unreachable.)
   currentState = STATE_BOOTING;
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
@@ -779,6 +804,13 @@ if (msg.indexOf("\"type\":\"deterrent\"") >= 0 || msg.indexOf("trigger") >= 0) {
 void handleHttpRequest(WiFiClient& client, const String& method, String path, const String& body) {
   path = stripQueryString(path);
 
+  // Root path: a browser/curl-friendly liveness check returning the same status
+  // payload. Useful for verifying the server is reachable from a laptop.
+  if (method == "GET" && (path == "/" || path == "/index.html")) {
+    sendHttpJson(client, 200, statusJson());
+    return;
+  }
+
   if (method == "OPTIONS") {
     sendHttpResponse(client, 204, "text/plain", "");
     return;
@@ -888,11 +920,21 @@ void handleLocalApi() {
 
   WiFiClient client = apiServer.available();
   if (!client) return;
+  if (!client.connected()) { client.stop(); return; }
 
+  // ESP32 quirk: apiServer.available() can hand us the client before the TCP
+  // payload is buffered. Wait briefly for the first byte so we don't read an
+  // empty line and drop the connection. A generous line timeout keeps a request
+  // line that arrives split across TCP segments intact (a short timeout here was
+  // dropping whole connections).
   client.setTimeout(1000);
+  unsigned long firstByteWait = millis();
+  while (client.connected() && !client.available() && millis() - firstByteWait < 1000) {
+    delay(2);
+  }
   String requestLine = client.readStringUntil('\n');
   requestLine.trim();
-  if (!requestLine.length()) {
+  if (requestLine.length() == 0) {
     client.stop();
     return;
   }
@@ -903,9 +945,12 @@ void handleLocalApi() {
     client.stop();
     return;
   }
-
   String method = requestLine.substring(0, firstSpace);
   String path = requestLine.substring(firstSpace + 1, secondSpace);
+
+  Serial.printf("🌐 %s %s from %s\n", method.c_str(), path.c_str(),
+                client.remoteIP().toString().c_str());
+
   int contentLength = 0;
   String wsKey;
   bool wantsWebSocket = false;
@@ -986,10 +1031,14 @@ void updateMatrixBrightness() {
   if (deterrentActive || currentState == STATE_ALERT) {
     base = 255;                                  // full brightness during alert
   } else if (currentState == STATE_ARMED_CLEAR) {
-    // Gentle "breathing" layered on top of the ambient base, so the LDR
-    // dimming still applies (previously drawArmedClear overrode it).
+    // Noticeable breathing on the armed-clear moon so it reads as "alive"
     float phase   = (millis() % 3000) / 3000.0f;
-    float breathe = 0.6f + 0.4f * (phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f);
+    float breathe = 0.5f + 0.5f * (phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f);
+    base = (int)(base * breathe);
+  } else if (currentState == STATE_DISARMED_IDLE) {
+    // Very slow, subtle pulse so standby doesn't look dead
+    float phase   = (millis() % 5000) / 5000.0f;
+    float breathe = 0.8f + 0.2f * (phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f);
     base = (int)(base * breathe);
   }
 
@@ -1247,108 +1296,136 @@ void updateSystemStateIfIdle() {
 // ==========================================================
 // 8x8 LED MATRIX DISPLAY FUNCTIONS
 // ==========================================================
+//
+// HCI iconography. The panel is monochrome, so every state is a distinct GLYPH
+// (shape you can learn) plus a BLINK CADENCE that only increases with urgency.
+// Glyphs are 8x8 bitmaps: '#' = lit, '.' = dark. Kept as readable strings so
+// the visual language is obvious at a glance and easy to tweak.
+// ==========================================================
 void setPixelXY(int row, int col, uint32_t color) {
   if (row < 0 || row >= MATRIX_ROWS || col < 0 || col >= MATRIX_COLS) return;
   int index = row * MATRIX_COLS + col;
   matrix.setPixelColor(index, color);
 }
 
-void drawHorizontalLine(int row, uint32_t color) {
-  for (int col = 0; col < MATRIX_COLS; col++) {
-    setPixelXY(row, col, color);
+// Render an 8x8 glyph bitmap (row-major, '#' lit). Used by every state draw.
+void drawGlyph(const char* glyph[8], uint32_t color) {
+  for (int r = 0; r < 8; ++r) {
+    for (int c = 0; c < 8; ++c) {
+      if (glyph[r][c] == '#') setPixelXY(r, c, color);
+    }
   }
 }
 
-void drawVerticalLine(int col, uint32_t color) {
-  for (int row = 0; row < MATRIX_ROWS; row++) {
-    setPixelXY(row, col, color);
-  }
-}
+// ---- Glyph definitions (monochrome, shape-coded) -------------------------
 
-void drawBorder(uint32_t color) {
-  drawHorizontalLine(0, color);
-  drawHorizontalLine(7, color);
-  drawVerticalLine(0, color);
-  drawVerticalLine(7, color);
-}
+// BOOTING: rotating dot around the perimeter (handled separately below).
 
-void drawCrosshair(uint32_t color) {
-  drawHorizontalLine(3, color);
-  drawHorizontalLine(4, color);
-  drawVerticalLine(3, color);
-  drawVerticalLine(4, color);
-}
+// DISARMED / standby: hollow ring = "neutral, powered but off".
+static const char* GLYPH_RING[8] = {
+  ".######.",
+  "#......#",
+  "#......#",
+  "#......#",
+  "#......#",
+  "#......#",
+  "#......#",
+  ".######.",
+};
+
+// ARMED + CLEAR: shield = "protected, monitoring, safe".
+static const char* GLYPH_SHIELD[8] = {
+  "..####..",
+  ".######.",
+  "########",
+  "#  #### #",
+  "#  #  # #",
+  "#  #  # #",
+  "#  #  # #",
+  "..#  #..",
+};
+
+// CAUTION (radar only): "?" = "sensed something, not yet confirmed".
+static const char* GLYPH_QUESTION[8] = {
+  "..####..",
+  ".######.",
+  "######..",
+  "..####..",
+  "...###..",
+  "....##..",
+  "........",
+  "...##...",
+};
+
+// DANGER (PIR+radar): "!" = "confirmed intruder".
+static const char* GLYPH_BANG[8] = {
+  "...##...",
+  "...##...",
+  "...##...",
+  "...##...",
+  "...##...",
+  "...##...",
+  "........",
+  "...##...",
+};
+
+// ALERT (deterrent firing): "X" = "active response".
+static const char* GLYPH_X[8] = {
+  "#......#",
+  ".#....#.",
+  "..#..#..",
+  "...##...",
+  "...##...",
+  "..#..#..",
+  ".#....#.",
+  "#......#",
+};
+
+// ---- State renderers -----------------------------------------------------
 
 void drawBootingSpinner() {
-  // Rotating perimeter animation
+  // Rotating perimeter dot — unambiguous "working / initialising".
   static const int perim[28][2] = {
     {0,0},{0,1},{0,2},{0,3},{0,4},{0,5},{0,6},{0,7},
     {1,7},{2,7},{3,7},{4,7},{5,7},{6,7},{7,7},
     {7,6},{7,5},{7,4},{7,3},{7,2},{7,1},{7,0},
     {6,0},{5,0},{4,0},{3,0},{2,0},{1,0}
   };
-  int pos = (millis() / 90) % 28;
-  uint32_t blue = matrix.Color(0, 60, 255);
-  setPixelXY(perim[pos][0], perim[pos][1], blue);
+  int pos = (millis() / 60) % 28;
+  setPixelXY(perim[pos][0], perim[pos][1], matrix.Color(255, 255, 255));
 }
 
 void drawDisarmedIdle() {
-  // GREEN standby sun — disarmed but safe. Dimmer green than the armed-clear
-  // moon, which breathes, so "off" vs "actively monitoring" stays readable.
-  uint32_t green = matrix.Color(0, 120, 0);
-  setPixelXY(3, 3, green); setPixelXY(3, 4, green);
-  setPixelXY(4, 3, green); setPixelXY(4, 4, green);
-  setPixelXY(1, 3, green); setPixelXY(1, 4, green);
-  setPixelXY(6, 3, green); setPixelXY(6, 4, green);
-  setPixelXY(3, 1, green); setPixelXY(4, 1, green);
-  setPixelXY(3, 6, green); setPixelXY(4, 6, green);
+  // Hollow ring, steady + dim. Reads as "off but alive".
+  drawGlyph(GLYPH_RING, matrix.Color(255, 255, 255));
 }
 
 void drawArmedClear() {
-  // GREEN breathing moon — system armed and all quiet (safe)
-  uint32_t green = matrix.Color(0, 200, 0);
-  int crescent[][2] = {{2,4},{2,5},{3,3},{3,6},{4,3},{4,6},{5,3},{5,6},{6,4},{6,5}};
-  for (auto &p : crescent) setPixelXY(p[0], p[1], green);
+  // Shield, steady + breathing (handled by updateMatrixBrightness). Reads as
+  // "armed and protecting, all quiet".
+  drawGlyph(GLYPH_SHIELD, matrix.Color(255, 255, 255));
 }
 
 void drawArmedCaution() {
-  // YELLOW border + inner pulse - radar only (caution)
-  uint32_t yellow = matrix.Color(255, 200, 0);
-  drawBorder(yellow);
-
-  // Pulsing inner dots
-  unsigned long pulse = (millis() / 300) % 2;
-  if (pulse) {
-    uint32_t yellowBright = matrix.Color(255, 235, 60);
-    setPixelXY(3, 3, yellowBright);
-    setPixelXY(3, 4, yellowBright);
-    setPixelXY(4, 3, yellowBright);
-    setPixelXY(4, 4, yellowBright);
+  // "?" pulsing slowly (~0.6 Hz). Same glyph lit/unlit so motion = "watching".
+  if ((millis() / 800) % 2 == 0) {
+    drawGlyph(GLYPH_QUESTION, matrix.Color(255, 255, 255));
   }
 }
 
 void drawArmedDanger() {
-  // Orange frame with inner warning - PIR + Radar
-  uint32_t orange = matrix.Color(255, 100, 0);
-  drawBorder(orange);
-  
-  // Flashing crosshair
-  if ((millis() / 200) % 2) {
-    drawCrosshair(orange);
+  // "!" blinking at a clear medium rate (~2.5 Hz) — confirmed threat.
+  if ((millis() / 200) % 2 == 0) {
+    drawGlyph(GLYPH_BANG, matrix.Color(255, 255, 255));
   }
 }
 
 void drawAlert() {
-  // Bold, glanceable RED alarm: solid red border + center block, blinking
-  // clearly (~2 Hz) so it reads as "danger" from a distance. No subtle
-  // twinkle — that read as decoration, not emergency.
-  uint32_t red = matrix.Color(255, 0, 0);
-  bool on = ((millis() / 250) % 2 == 0);   // ~2 Hz clear blink
-  if (!on) return;
-  drawBorder(red);
-  for (int r = 3; r <= 4; r++)
-    for (int c = 3; c <= 4; c++)
-      setPixelXY(r, c, red);
+  // "X" fast-blinking (~4 Hz) at full brightness — deterrent is firing.
+  // Cadence + full-intensity brightness make this unmistakable from afar.
+  if ((millis() / 125) % 2 == 0) {
+    drawGlyph(GLYPH_X, matrix.Color(255, 255, 255));
+  }
 }
 
 void drawButtonAckOverlay() {
@@ -1356,11 +1433,9 @@ void drawButtonAckOverlay() {
     buttonAckActive = false;
     return;
   }
-  
-  // White flash confirmation
-  uint32_t white = matrix.Color(255, 255, 255);
+  // Brief full-panel flash = immediate, unambiguous "press acknowledged".
   for (int i = 0; i < NUM_PIXELS; i++) {
-    matrix.setPixelColor(i, white);
+    matrix.setPixelColor(i, matrix.Color(255, 255, 255));
   }
 }
 
@@ -1398,10 +1473,10 @@ void updateMatrixDisplay() {
     drawButtonAckOverlay();
   }
 
-  // Offline marker: if we've lost the WiFi link to the app, blink a blue
-  // pixel in the corner so the device itself says "not connected".
+  // Offline marker: if we've lost the WiFi link to the app, blink a corner
+  // pixel so the device itself says "not connected" (monochrome white).
   if (WiFi.status() != WL_CONNECTED && (millis() / 500) % 2 == 0) {
-    setPixelXY(0, 0, matrix.Color(0, 60, 255));
+    setPixelXY(0, 0, matrix.Color(255, 255, 255));
   }
 
   matrix.show();
@@ -1418,8 +1493,12 @@ void handleNetwork() {
   } else {
     digitalWrite(PIN_LED_WIFI, HIGH);
     if (!mdnsStarted) {
+      Serial.print("✓ Station linked. Device IP: ");
+      Serial.println(WiFi.localIP());
       if (MDNS.begin("coop-plus")) {
         MDNS.addService("http", "tcp", 80);
+        MDNS.addServiceTxt("http", "tcp", "path", "/api/status");
+        MDNS.addServiceTxt("http", "tcp", "device", "coop-plus");
         mdnsStarted = true;
         Serial.println("✓ mDNS Responder started: http://coop-plus.local");
       }
@@ -1456,6 +1535,9 @@ void handleSerialTestMode() {
   }
   else if (cmd == "matrix") {
     testMatrix();
+  }
+  else if (cmd == "matrix_raw") {
+    testMatrixRaw();
   }
   else if (cmd == "status") {
     printSystemStatus();
@@ -1534,6 +1616,39 @@ void testMatrix() {
   matrix.show();
   currentState = saved;
   Serial.println("✓ Matrix test complete\n");
+}
+
+void testMatrixRaw() {
+  Serial.println("🧪 Matrix RAW hardware test (MAX7219 shiftOut)...");
+  matrix.clear();
+  matrix.show();
+  delay(500);
+
+  // Row sweep: one row at a time
+  for (int r = 0; r < 8; r++) {
+    matrix.clear();
+    for (int c = 0; c < 8; c++) matrix.setPixelColor(r * 8 + c, matrix.Color(255, 255, 255));
+    matrix.show();
+    delay(300);
+  }
+
+  // Column sweep: one column at a time
+  for (int c = 0; c < 8; c++) {
+    matrix.clear();
+    for (int r = 0; r < 8; r++) matrix.setPixelColor(r * 8 + c, matrix.Color(255, 255, 255));
+    matrix.show();
+    delay(300);
+  }
+
+  // All on / all off
+  matrix.clear();
+  for (int i = 0; i < 64; i++) matrix.setPixelColor(i, matrix.Color(255, 255, 255));
+  matrix.show();
+  delay(800);
+  matrix.clear();
+  matrix.show();
+
+  Serial.println("✓ Matrix raw hardware test complete\n");
 }
 
 void printSystemStatus() {

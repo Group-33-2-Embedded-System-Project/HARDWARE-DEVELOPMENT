@@ -14,22 +14,31 @@
       "infoPlist": {
         "NSAppTransportSecurity": {
           "NSAllowsArbitraryLoads": true
-        }
+        },
+        "NSLocalNetworkUsageDescription": "Coop+ uses the local network to find and connect to your Smart Coop Defender on Wi-Fi.",
+        "NSBonjourServices": [
+          "_http._tcp",
+          "_coop-plus._tcp"
+        ]
       }
     },
     "android": {
       "package": "com.coopplus.app",
+      "usesCleartextTraffic": true,
+      "networkSecurityConfig": "./network_security_config.xml",
       "adaptiveIcon": {
         "backgroundColor": "#CFD91A"
       }
     },
     "plugins": [
-      "expo-font"
+      "expo-font",
+      "./withCleartext.js"
     ],
     "extra": {
       "eas": {
-        "projectId": "d080d752-a699-4809-a386-1a2c3a0846ec"
+        "projectId": "a82e6316-9c77-4d72-923e-adbc993408ec"
       }
-    }
+    },
+    "owner": "admin1236776efue5"
   }
 }
